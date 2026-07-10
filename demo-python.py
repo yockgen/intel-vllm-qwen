@@ -5,21 +5,21 @@ age = input("Enter your age: ")
 
 print("Hello " + name)
 
-# Error 1: age is a string, but adding an integer
-next_year = age + 1
+# Fix 1: age is a string, convert to int before adding
+next_year = int(age) + 1
 
 print("Next year you will be", next_year)
 
 numbers = [10, 20, 30]
 
-# Error 2: List index out of range
-print("Fourth number:", numbers[3])
+# Fix 2: List index out of range - use valid index (0, 1, 2)
+print("Fourth number:", numbers[2])
 
-# Error 3: Variable name typo
+# Fix 3: Variable name typo - 'total' not 'totall'
 total = 100
-print("Total is", totall)
+print("Total is", total)
 
-# Error 4: Division by zero
-result = 100 / 0
+# Fix 4: Division by zero - use a non-zero divisor
+result = 100 / 1
 
 print("Result:", result)
