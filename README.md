@@ -332,6 +332,94 @@ no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models | python3 -m json.too
 MODEL=Qwen3-8B RUNS=3 ./measurement.sh
 ```
 
+**Monitor GPU utilization in real-time**
+
+Use this tutorial to watch GPU utilization spike while the model is processing requests — useful to confirm the XPU is active and to spot memory or compute bottlenecks.
+
+**Step 1 — Find out how many devices are present**
+
+```bash
+xpu-smi discovery
+```
+
+Note the device indices listed (typically `0` for one GPU, `0` and `1` for two). Adjust the loop below to match.
+
+**Step 2 — Start the live monitor in a dedicated terminal**
+
+Open a terminal and run the loop below. It prints a timestamped line every second with the GPU utilization percentage of each device. Edit `for d in 0 1` to match your actual device indices (e.g. `for d in 0` for a single GPU):
+
+```bash
+while true; do
+    printf "%(%H:%M:%S)T  " -1
+    for d in 0 1; do
+        util=$(xpu-smi stats -d "$d" | awk -F"|" '/GPU Utilization/{gsub(/ /,"",$3); print $3}')
+        printf "GPU%d: %3s%%  " "$d" "$util"
+    done
+    echo
+    sleep 1
+done
+```
+
+Example output while idle:
+
+```
+14:02:01  GPU0:   2%  GPU1:   1%
+14:02:02  GPU0:   2%  GPU1:   1%
+```
+
+**Step 3 — Generate load from a second terminal**
+
+Open a second terminal and send a request to the model (or start [Hermes](../10-hermes) and ask it a question). For example:
+
+```bash
+curl -s http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-8B",
+    "messages": [{"role": "user", "content": "Explain quantum entanglement in detail."}],
+    "max_tokens": 512,
+    "temperature": 0
+  }' | python3 -m json.tool
+```
+
+**Step 4 — Expected result**
+
+Switch back to the monitor terminal. While tokens are being generated you should see GPU utilization climb — typically **40–95 %** on the active card(s):
+
+```
+14:02:15  GPU0:  78%  GPU1:   1%
+14:02:16  GPU0:  91%  GPU1:   2%
+14:02:17  GPU0:  85%  GPU1:   1%
+```
+
+After the response completes, utilization returns to idle levels. If it stays at 0 % the request did not reach the XPU (check `docker logs vllm`).
+
+---
+
+**Quick tokens/sec measurement** (single request, no extra tooling needed):
+
+Set `TOKENS` to the number of output tokens you want generated, replace the model name if needed, then run:
+
+```bash
+TOKENS=1000
+
+TIME=$(curl -s -o /dev/null \
+  -w "%{time_total}" \
+  http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"model\":\"Qwen3-8B\",
+    \"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],
+    \"max_tokens\":$TOKENS,
+    \"temperature\":0
+  }")
+
+echo "Time: $TIME s"
+echo "Tokens/sec: $(awk "BEGIN {print $TOKENS/$TIME}")"
+```
+
+This measures **end-to-end wall time** for the full response, then divides by `TOKENS` to get a rough generation throughput. For the 35B MoE substitute `\"model\":\"Qwen3.5-35B-A3B\"`. Note: the first request after startup may be slower due to warm-up; run it twice and use the second result for a fairer number.
+
 ---
 
 ## Troubleshooting
