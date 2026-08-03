@@ -4,21 +4,21 @@ This directory runs [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler)
 
 The main entrypoint is **`start.sh`**: it loads the container image (if needed), downloads the Hugging Face model **once** into a persistent cache, stops any old `vllm` container, and starts a new one. Use **`stop.sh`** to stop and remove the container (the model cache is left intact).
 
-**Default model is `Qwen/Qwen3-8B`** (fp16), served with a **64k context window** (YaRN rope scaling) and **tool calling enabled** — chosen so a single Arc can back an agent such as [Hermes](../10-hermes), which requires a model with **>= 64,000 tokens** of context. The larger `Qwen/Qwen3.5-35B-A3B` MoE is still available (higher quality, but only ~8k context on one GPU); run it explicitly with `HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B ./start.sh`.
+**Default model is `Qwen/Qwen3.6-35B-A3B`** (MoE), served with `sym_int4` and an ~8k context profile on one Arc. This is a quality-first default and is **not** Hermes-ready out of the box (Hermes needs >=64k context). For Hermes/tool-agent usage, switch to a small dense model profile such as `HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh`.
 
 ## Prerequisites
 
 - Docker (or Podman with compatible `docker` CLI)
 - Intel Arc GPU with `/dev/dri` available on the host
-- Image `intel/llm-scaler-vllm:0.14.0-b8.3.2` locally, or `llm-scaler-vllm.tar` in this directory (loaded automatically)
+- Image `intel/llm-scaler-vllm:latest` locally (or whichever image you set in `VLLM_IMAGE`), or `llm-scaler-vllm.tar` in this directory (loaded automatically)
 - Enough **disk** under `HF_MODEL_CACHE_ROOT` for the chosen model
 - For gated models: `HF_TOKEN` set on first download
 
-Default/recommended image tag: `intel/llm-scaler-vllm:0.14.0-b8.3.2` (override with `VLLM_IMAGE`). The image is never pulled from a registry — `start.sh` only `docker load`s a local `llm-scaler-vllm.tar` or uses an already-loaded image, then runs everything offline.
+Default image tag in script: `intel/llm-scaler-vllm:latest` (override with `VLLM_IMAGE`). The image is never pulled from a registry — `start.sh` only `docker load`s a local `llm-scaler-vllm.tar` or uses an already-loaded image, then runs everything offline.
 
 ## Quick start
 
-**Default profile:** `Qwen/Qwen3-8B` (fp16) on **one Arc**, **64k context** via YaRN, **tool calling on**. Plain `./start.sh` uses that — no extra env vars required.
+**Default profile:** `Qwen/Qwen3.6-35B-A3B` (MoE) on **one Arc**, **~8k context**, `sym_int4` quantization, and tool calling enabled. Plain `./start.sh` uses that — no extra env vars required.
 
 ```bash
 cd /data/home_aibox/services/intel-vllm-qwen
@@ -28,31 +28,33 @@ export HF_TOKEN=hf_...   # first download only, if the repo requires it
 ./start.sh
 
 docker logs -f vllm
-no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models   # max_model_len should be 65536
+no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models   # default profile reports max_model_len 8192
 ```
 
-Equivalent explicit settings (already the `start.sh` defaults for Qwen3-8B):
+Equivalent explicit settings (already the `start.sh` defaults for the 35B MoE profile):
 
 ```bash
-HF_MODEL_ID=Qwen/Qwen3-8B \
-VLLM_MAX_MODEL_LEN=65536 \
-VLLM_GPU_MEMORY_UTILIZATION=0.95 \
+HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B \
+VLLM_QUANTIZATION=sym_int4 \
+VLLM_MAX_MODEL_LEN=8192 \
+VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
+VLLM_GPU_MEMORY_UTILIZATION=0.90 \
 VLLM_TENSOR_PARALLEL_SIZE=1 \
-VLLM_ROPE_SCALING='{"rope_type":"yarn","factor":1.6,"original_max_position_embeddings":40960}' \
+VLLM_PREFIX_CACHING=0 \
 VLLM_ENABLE_AUTO_TOOL_CHOICE=1 \
 VLLM_TOOL_CALL_PARSER=hermes \
 ./start.sh
 ```
 
-`start.sh` **stops and replaces** the existing container named `vllm` (or `VLLM_CONTAINER_NAME`), so you do not need to stop before re-running. To stop it deliberately (e.g. to free the GPU), run **`./stop.sh`**.
+`start.sh` **stops and replaces** the existing container named `vllm` (or `VLLM_CONTAINER_NAME`) — in both the rootless and rootful container stores — and waits for the host port to be released, so you do not need to stop before re-running. To stop it deliberately (e.g. to free the GPU), run **`./stop.sh`**. If a port stays stuck, see [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy).
 
-Startup for the **8B** default is quick (fp16, no quant). The **35B + online INT4** path can take **20–40+ minutes** on first run (loading 14 safetensor shards, quantizing on XPU). Later restarts are faster if weights are already on disk.
+With the current default (**35B MoE + online INT4**), first startup can take **20–40+ minutes** (loading shards, quantizing on XPU). Later restarts are faster if weights are already on disk.
 
 ---
 
 ## Serving for Hermes Agent (or any tool-calling agent)
 
-The defaults above are already Hermes-ready. Two requirements drive them:
+Hermes requires a small-dense 64k profile (for example `HF_MODEL_ID=Qwen/Qwen3-8B`). Two requirements drive that profile:
 
 - **Context >= 64k.** Hermes Agent rejects any model reporting less than **64,000 tokens** at startup. Qwen3-8B's native window is `40960`, so `start.sh` extends it to `65536` via YaRN (`VLLM_ROPE_SCALING`). Verify with `/v1/models` → `max_model_len: 65536`.
 - **Tool calling flags.** vLLM only emits structured tool calls with `--enable-auto-tool-choice --tool-call-parser hermes`; otherwise tool calls come back as plain text. `start.sh` sets both by default.
@@ -78,9 +80,9 @@ Run the Hermes setup wizard (`hermes setup`, or `sh /home/aibox/hermes-deploy/ru
 
 Use **one command block** that matches your model. The API model name is the last segment of `HF_MODEL_ID` (e.g. `Qwen3-8B`, `Qwen3.5-35B-A3B`). Set the same name in `measurement.sh` via `MODEL=`.
 
-### Qwen3-8B (dense, single Arc) — **default**, 64k context
+### Qwen3-8B (dense, single Arc), 64k context
 
-Fits in FP16 on one GPU without quantization. This is what plain `./start.sh` runs; the block below is the equivalent explicit form.
+Fits in FP16 on one GPU without quantization. Use this profile explicitly for Hermes-ready 64k context.
 
 ```bash
 HF_MODEL_ID=Qwen/Qwen3-8B \
@@ -132,8 +134,8 @@ Intel XPU MoE only implements **online FP8** from full BF16/FP16 weights (`--qua
 Best quality on one GPU, but only ~8k context (too small for Hermes). Selected automatically when `HF_MODEL_ID` matches the 35B MoE. Online FP8 from BF16 on one card often OOMs; Intel’s fit-for-one-GPU path is **online `sym_int4`**.
 
 ```bash
-# Run the 35B MoE instead of the 8B default:
-HF_MODEL_ID=Qwen/Qwen3.5-35B-A3B \
+# Run the default 35B MoE profile explicitly:
+HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B \
 VLLM_QUANTIZATION=sym_int4 \
 VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=1 \
 VLLM_DTYPE=float16 \
@@ -238,7 +240,7 @@ All variables are optional unless noted. Export them **before** `./start.sh`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `HF_MODEL_ID` | `Qwen/Qwen3-8B` | Hugging Face model id |
+| `HF_MODEL_ID` | `Qwen/Qwen3.6-35B-A3B` | Hugging Face model id |
 | `HF_GGUF_FILE` | *(unset)* | If set, download/serve a single `.gguf` file instead of full safetensors |
 | `HF_MODEL_CACHE_ROOT` | `/home/aibox/models/huggingface` | Host directory mounted at `/models` in the container |
 | `HF_TOKEN` | *(unset)* | Token for gated downloads (first run) |
@@ -249,10 +251,12 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_IMAGE` | `intel/llm-scaler-vllm:0.14.0-b8.3.2` | Docker image (loaded locally, never pulled) |
+| `VLLM_IMAGE` | `intel/llm-scaler-vllm:latest` | Docker image (loaded locally, never pulled) |
 | `VLLM_CONTAINER_NAME` | `vllm` | Container name |
 | `VLLM_PORT` | `8000` | Host port → API `8000` |
 | `VLLM_IPC` | `host` | `host` → `--ipc=host`; else use `VLLM_SHM_SIZE` (default `16g`) |
+| `VLLM_LD_LIBRARY_PATH` | `/opt/intel/oneapi/ccl/latest/lib:/opt/intel/oneapi/2025.3/lib` | Value used when injecting `LD_LIBRARY_PATH` into container |
+| `VLLM_SET_LD_LIBRARY_PATH` | `auto` | `auto`: disable for scaler images, enable for regular vllm images; `1` force on; `0` force off |
 
 ### Memory and quantization (XPU)
 
@@ -270,12 +274,12 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `VLLM_DTYPE` | `float16` | `float16`, `bfloat16`, etc. |
-| `VLLM_MAX_MODEL_LEN` | `65536` (8B) / `8192` (35B MoE) | Max context length; profile-dependent |
-| `VLLM_MAX_NUM_BATCHED_TOKENS` | `8192` | Chunked prefill batch cap |
+| `VLLM_MAX_MODEL_LEN` | `8192` (large MoE) / `65536` (small dense) | Max context length; profile-dependent |
+| `VLLM_MAX_NUM_BATCHED_TOKENS` | `2048` (large MoE) / `8192` (others) | Chunked prefill batch cap |
 | `VLLM_BLOCK_SIZE` | `64` | KV block size |
 | `VLLM_ENFORCE_EAGER` | `1` | `1` → `--enforce-eager`; `0` to disable |
 | `VLLM_PREFIX_CACHING` | `1` or profile | `0` → `--no-enable-prefix-caching` (large MoE / tight VRAM) |
-| `VLLM_ROPE_SCALING` | YaRN JSON (8B profile) | rope_scaling dict injected via `--hf-overrides`; set empty to disable |
+| `VLLM_ROPE_SCALING` | YaRN JSON (small dense profile) | rope_scaling dict injected via `--hf-overrides`; set empty to disable |
 | `VLLM_ENABLE_AUTO_TOOL_CHOICE` | `1` | `1` → `--enable-auto-tool-choice` (needed by agents); `0` to disable |
 | `VLLM_TOOL_CALL_PARSER` | `hermes` | `--tool-call-parser` value (e.g. `hermes`, `llama3_json`, `mistral`) |
 | `VLLM_EXTRA_ARGS` | *(unset)* | Extra flags passed to `vllm serve` (shell word-split), e.g. `--reasoning-parser qwen3` |
@@ -289,7 +293,7 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 
 `VLLM_TARGET_DEVICE=xpu` is always set by the script.
 
-`start.sh` picks defaults from the model id: **small dense** (8B/7B/0.6B → the default `Qwen3-0.6B`) gets fp16 + 64k YaRN, **large MoE** (35B/30B-A3B/122B) gets `sym_int4` at ~8k, and `*-FP8` ids are blocked (see above). Export a variable before `./start.sh` to override any of it.
+`start.sh` picks defaults from the model id: **small dense** (`8B/7B/2B/0.6B`) gets fp16 + 64k YaRN, **large MoE** (`35B/30B-A3B/122B`) gets `sym_int4` at ~8k, and `*-FP8` ids are blocked (see above). Current script default model id is `Qwen/Qwen3.6-35B-A3B`. Export a variable before `./start.sh` to override any of it.
 
 ---
 
@@ -323,13 +327,39 @@ no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models | python3 -m json.too
 **Stop (and remove) the container**
 
 ```bash
-./stop.sh          # docker stop + rm of $VLLM_CONTAINER_NAME (default: vllm); cache untouched
+./stop.sh          # stop + rm of $VLLM_CONTAINER_NAME (default: vllm); cache untouched
+./stop.sh --force  # also kill a leaked runtime process still holding the port
 ```
+
+`stop.sh` removes the container from **both** container stores (see below), then
+**verifies port `$VLLM_PORT` was actually released**. It exits non-zero and names
+the process still holding the port instead of reporting a success that did not
+happen. `start.sh` runs the same cleanup as a preflight and refuses to launch
+(rather than failing on the bind) if the port cannot be freed.
+
+### Rootless vs rootful: why the port can stay busy
+
+On hosts where `docker` is a **Podman** shim, Podman keeps two *independent*
+container stores: one for your user (rootless) and one for root (rootful). A
+`vllm` container started with `sudo` is **invisible to `docker ps` as your user**
+but still holds the published port. The old scripts only looked at the rootless
+store, so `./stop.sh` printed `vllm stopped` while a root-owned container kept
+port 8000, and the next `./start.sh` failed with:
+
+```
+Error: rootlessport listen tcp 0.0.0.0:8000: bind: address already in use
+```
+
+Both scripts now check the root store too, via **passwordless `sudo` only** — if
+`sudo -n` needs a password they say so and tell you to run `sudo ./stop.sh`.
+`--force` kills a leaked listener only when it is a container-runtime process
+(`conmon`, `rootlessport`, `pasta`, `slirp4netns`, `docker-proxy`); anything else
+is reported and left alone.
 
 **Benchmark** (after the server is ready; `MODEL` must match `--served-model-name`):
 
 ```bash
-MODEL=Qwen3-8B RUNS=3 ./measurement.sh
+MODEL=Qwen3.6-35B-A3B RUNS=3 ./measurement.sh
 ```
 
 ---
@@ -346,6 +376,9 @@ MODEL=Qwen3-8B RUNS=3 ./measurement.sh
 | OOM on host during load | `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0` (Intel doc tradeoff) or more free RAM |
 | Download fails | Set `HF_TOKEN`; ensure network on first run (download container only) |
 | Image not found | Place `llm-scaler-vllm.tar` here or `docker load -i ...` |
+| `bind: address already in use` after `./stop.sh` | A container in the *other* Podman store (usually root) holds the port. Run `./stop.sh` (now checks both), then `sudo ./stop.sh --force` if it persists. See [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy) |
+| `docker ps` shows nothing but the port is busy | Same rootless/rootful split — check with `sudo docker ps -a` |
+| Server never answers `/v1/models`, log stops after `Loading weights took ...` | Not hung: `sym_int4`/fp8 **online quantization** of a 67 GiB MoE checkpoint runs on CPU for many minutes. Confirm progress with `ps -o %cpu,rss -p $(pgrep -f VLLM::EngineCore)` — high CPU means it is working |
 
 ---
 
@@ -353,8 +386,9 @@ MODEL=Qwen3-8B RUNS=3 ./measurement.sh
 
 | File | Purpose |
 |------|---------|
-| `start.sh` | Download (once) + run vLLM server |
-| `stop.sh` | Stop and remove the vLLM container (keeps the model cache) |
+| `start.sh` | Download (once) + run vLLM server; frees a stuck port first |
+| `stop.sh` | Stop and remove the vLLM container (keeps the model cache); verifies the port is released |
+| `vllm-common.sh` | Shared container/port cleanup helpers sourced by both scripts |
 | `measurement.sh` | Simple throughput test against `/v1/chat/completions` |
 | `llm-scaler-vllm.tar` | Optional offline image load |
 

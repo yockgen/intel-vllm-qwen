@@ -8,6 +8,24 @@ IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:latest}"
 CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm}"
 HOST_PORT="${VLLM_PORT:-8000}"
 
+# Container/port cleanup helpers shared with stop.sh (handles the rootless vs
+# rootful Podman split that causes "bind: address already in use").
+# shellcheck source=vllm-common.sh
+. "$DIR/vllm-common.sh"
+
+# ./start.sh --force  → also kill a leaked runtime listener still holding the port.
+FORCE_CLEANUP=0
+for arg in "$@"; do
+  case "$arg" in
+    -f|--force) FORCE_CLEANUP=1 ;;
+    -h|--help)
+      echo "Usage: ./start.sh [--force]   (--force frees a stuck port $HOST_PORT)"
+      echo "Tuning is via env vars — see README.md 'Environment reference'."
+      exit 0 ;;
+    *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
+  esac
+done
+
 # HuggingFace source (full safetensors by default). Override, e.g. FP8 or a smaller model:
 #   HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh
 # Set HF_GGUF_FILE to a *.gguf name to fetch/serve a single GGUF file instead.
@@ -22,6 +40,10 @@ MODEL_DIR_BASENAME="$(basename "$HF_MODEL_ID")"
 CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
 
 # vLLM tuning — env vars set before ./start.sh win; otherwise profile by model id.
+# Default context window: 65536 (same as running `VLLM_MAX_MODEL_LEN=65536 ./start.sh`).
+# Set before the per-model profiles so their `:-` fallbacks are already satisfied;
+# override per run with e.g. `VLLM_MAX_MODEL_LEN=8192 ./start.sh`.
+VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
 VLLM_CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
@@ -210,7 +232,22 @@ echo "    Memory: XPU util ${VLLM_GPU_MEMORY_UTILIZATION}, quant=${VLLM_QUANTIZA
 if [ "$_large_moe" = 1 ] && [ "$_prequant_fp8" = 0 ] && [ "$VLLM_TENSOR_PARALLEL_SIZE" = 1 ] && [ "${VLLM_QUANTIZATION}" = "fp8" ]; then
   echo "    NOTE: Online FP8 on one ~32 GiB GPU may OOM; default is sym_int4, or use VLLM_TENSOR_PARALLEL_SIZE=2"
 fi
-docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
+echo "==> Preflight: clear old '$CONTAINER_NAME' and free port $HOST_PORT"
+remove_vllm_container || true
+if ! wait_for_port_free; then
+  report_port_holder
+  if [ "$FORCE_CLEANUP" = 1 ] && kill_port_holder && wait_for_port_free; then
+    echo "    port $HOST_PORT freed (forced)"
+  else
+    echo ""
+    echo "ERROR: port $HOST_PORT is occupied; the container would fail to bind."
+    echo "Fix options:"
+    echo "  1) Free it:          ./stop.sh --force     (or: sudo ./stop.sh --force)"
+    echo "  2) Use another port: VLLM_PORT=8001 ./start.sh"
+    echo "  3) Retry with force: ./start.sh --force"
+    exit 1
+  fi
+fi
 
 QUANT_ARGS=()
 if [ -n "$VLLM_QUANTIZATION" ]; then
@@ -271,6 +308,9 @@ else
 fi
 
 # Weights are local now; keep the serve container off the network for models.
+  # -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
+echo "==> Running docker command (expanded):"
+set -x
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   --pull=never \
   --user 0:0 \
@@ -279,7 +319,6 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   -v /dev/dri/by-path:/dev/dri/by-path \
   "${SHM_OPTS[@]}" \
   -e VLLM_TARGET_DEVICE=xpu \
-  -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
   -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
   "${OFFLOAD_QUANT_ENV[@]}" \
@@ -309,9 +348,22 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${TOOL_ARGS[@]}" \
   --trust-remote-code \
   ${VLLM_EXTRA_ARGS:-}
+set +x
+
+# Catch the common "docker run succeeded, container died seconds later" case
+# (bad flag, XPU OOM at init) instead of leaving the user to discover it later.
+sleep 5
+started_state="$(container_state user "$CONTAINER_NAME")"
+if [ "$started_state" != running ] && [ "$started_state" != created ]; then
+  echo ""
+  echo "ERROR: '$CONTAINER_NAME' is not running (state: $started_state). Last log lines:"
+  docker logs --tail 30 "$CONTAINER_NAME" 2>&1 | sed 's/^/    /' || true
+  exit 1
+fi
 
 echo ""
 echo "Done. $CONTAINER_NAME is starting (OpenAI API on port $HOST_PORT)."
-echo "Logs: docker logs -f $CONTAINER_NAME"
-echo "Test:  no_proxy=127.0.0.1 curl -s http://127.0.0.1:${HOST_PORT}/v1/models"
+echo "Model load takes minutes; the API 404s/refuses until it finishes."
+echo "Logs:  docker logs -f $CONTAINER_NAME"
+echo "Ready: no_proxy=127.0.0.1 curl -s http://127.0.0.1:${HOST_PORT}/v1/models"
 
