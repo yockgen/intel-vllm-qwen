@@ -1,25 +1,25 @@
-# simple_error.py
+# simple_error.py — fixed version
 
 name = input("Enter your name: ")
 age = input("Enter your age: ")
 
 print("Hello " + name)
 
-# Error 1: age is a string, but adding an integer
-next_year = age + 1
+# Fix 1: Convert age to int before adding
+next_year = int(age) + 1
 
 print("Next year you will be", next_year)
 
 numbers = [10, 20, 30]
 
-# Error 2: List index out of range
-print("Fourth number:", numbers[3])
+# Fix 2: Access index 2 (third element) instead of index 3 (out of range)
+print("Fourth number:", numbers[2])
 
-# Error 3: Variable name typo
+# Fix 3: Corrected variable name from 'totall' to 'total'
 total = 100
-print("Total is", totall)
+print("Total is", total)
 
-# Error 4: Division by zero
-result = 100 / 0
+# Fix 4: Divide by non-zero value
+result = 100 / 10
 
 print("Result:", result)
