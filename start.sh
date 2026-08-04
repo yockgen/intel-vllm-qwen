@@ -14,12 +14,19 @@ HOST_PORT="${VLLM_PORT:-8000}"
 . "$DIR/vllm-common.sh"
 
 # ./start.sh --force  → also kill a leaked runtime listener still holding the port.
+# ./start.sh --pull-only → download the model into the cache (if missing) then exit,
+#   without touching the container or port. Used by deploy.sh's "pull" subcommand so
+#   download logic lives in one place.
 FORCE_CLEANUP=0
+PULL_ONLY=0
 for arg in "$@"; do
   case "$arg" in
     -f|--force) FORCE_CLEANUP=1 ;;
+    --pull-only) PULL_ONLY=1 ;;
     -h|--help)
-      echo "Usage: ./start.sh [--force]   (--force frees a stuck port $HOST_PORT)"
+      echo "Usage: ./start.sh [--force] [--pull-only]"
+      echo "  --force      free a stuck port $HOST_PORT before starting"
+      echo "  --pull-only  download the model into the cache, then exit (no serve)"
       echo "Tuning is via env vars — see README.md 'Environment reference'."
       exit 0 ;;
     *) echo "Unknown option: $arg (try --help)" >&2; exit 2 ;;
@@ -223,6 +230,12 @@ else
       --local-dir "/models/$MODEL_DIR_BASENAME"
   touch "$CACHE_DIR/.download-complete"
   echo "    Download complete."
+fi
+
+# --pull-only: cache is ready; stop here without touching the container or port.
+if [ "$PULL_ONLY" = 1 ]; then
+  echo "==> Pull-only: model is cached at $CACHE_DIR (not serving)."
+  exit 0
 fi
 
 echo "==> Start container ($IMAGE) with $MODEL_IN_CONTAINER"

@@ -1,10 +1,15 @@
 # vLLM on Intel XPU (Arc)
 
-This directory runs [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler) in Docker on **Intel Arc (XPU)** with an OpenAI-compatible API on port **8000**.
+This directory runs [Intel llm-scaler-vllm](https://github.com/intel/llm-scaler) in Docker on **Intel Arc (XPU)** with an OpenAI-compatible API.
 
-The main entrypoint is **`start.sh`**: it loads the container image (if needed), downloads the Hugging Face model **once** into a persistent cache, stops any old `vllm` container, and starts a new one. Use **`stop.sh`** to stop and remove the container (the model cache is left intact).
+**Start here: `./deploy.sh`.** It manages a small set of models you declare once in **`deploy.conf`** (name, Hugging Face id, port, any overrides) and switches between them — download-if-missing, start, stop, status — one active model at a time so each gets the whole GPU. This is the recommended way to drive the server day to day.
 
-**Default model is `Qwen/Qwen3.6-35B-A3B`** (MoE), served with `sym_int4` and an ~8k context profile on one Arc. This is a quality-first default and is **not** Hermes-ready out of the box (Hermes needs >=64k context). For Hermes/tool-agent usage, switch to a small dense model profile such as `HF_MODEL_ID=Qwen/Qwen3-8B ./start.sh`.
+Under the hood `deploy.sh` calls two lower-level scripts, which you can also run directly when you need full control over a single launch:
+
+- **`start.sh`** — loads the image (if needed), downloads the model **once** into a persistent cache, clears any old container, and serves it. Everything is tuned via environment variables (see [Environment reference](#environment-reference)).
+- **`stop.sh`** — stops and removes the container (the model cache is left intact) and verifies the port was freed.
+
+**Default models in `deploy.conf`:** `qwen3.6-35b-a3b` (`Qwen/Qwen3.6-35B-A3B` MoE, `sym_int4`, ~8k context, port 8000) and `gemma4-e4b` (`google/gemma-4-E4B-it`, port 8001). Add your own with one line each — see [Managing models with deploy.sh](#managing-models-with-deploysh).
 
 ## Prerequisites
 
@@ -18,37 +23,93 @@ Default image tag in script: `intel/llm-scaler-vllm:latest` (override with `VLLM
 
 ## Quick start
 
-**Default profile:** `Qwen/Qwen3.6-35B-A3B` (MoE) on **one Arc**, **~8k context**, `sym_int4` quantization, and tool calling enabled. Plain `./start.sh` uses that — no extra env vars required.
-
 ```bash
 cd /data/home_aibox/services/intel-vllm-qwen
-chmod +x start.sh stop.sh
+chmod +x deploy.sh start.sh stop.sh
 
-export HF_TOKEN=hf_...   # first download only, if the repo requires it
-./start.sh
+export HF_TOKEN=hf_...          # only needed for gated models (e.g. gemma), first download
 
-docker logs -f vllm
-no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models   # default profile reports max_model_len 8192
+./deploy.sh                     # show configured models + their state
+./deploy.sh pull                # download every configured model into the cache (no serve)
+./deploy.sh up gemma4-e4b       # make gemma the active model (serves on port 8001)
+./deploy.sh status              # wait until it shows ready(200)
 ```
 
-Equivalent explicit settings (already the `start.sh` defaults for the 35B MoE profile):
+Then hit the API (the model name is the last segment of the Hugging Face id):
 
 ```bash
-HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B \
-VLLM_QUANTIZATION=sym_int4 \
-VLLM_MAX_MODEL_LEN=8192 \
-VLLM_MAX_NUM_BATCHED_TOKENS=2048 \
-VLLM_GPU_MEMORY_UTILIZATION=0.90 \
-VLLM_TENSOR_PARALLEL_SIZE=1 \
-VLLM_PREFIX_CACHING=0 \
-VLLM_ENABLE_AUTO_TOOL_CHOICE=1 \
-VLLM_TOOL_CALL_PARSER=hermes \
-./start.sh
+no_proxy=127.0.0.1 curl -s http://127.0.0.1:8001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"gemma-4-E4B-it","messages":[{"role":"user","content":"Hello in one sentence."}],"max_tokens":64}' \
+  | python3 -m json.tool
 ```
 
-`start.sh` **stops and replaces** the existing container named `vllm` (or `VLLM_CONTAINER_NAME`) — in both the rootless and rootful container stores — and waits for the host port to be released, so you do not need to stop before re-running. To stop it deliberately (e.g. to free the GPU), run **`./stop.sh`**. If a port stays stuck, see [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy).
+Switch models any time — `up` stops the others first so the new one gets the whole GPU:
 
-With the current default (**35B MoE + online INT4**), first startup can take **20–40+ minutes** (loading shards, quantizing on XPU). Later restarts are faster if weights are already on disk.
+```bash
+./deploy.sh up qwen3.6-35b-a3b  # stops gemma, serves the 35B MoE on port 8000
+```
+
+First startup of the **35B MoE** can take **20–40+ minutes** (loading shards, quantizing on XPU); later restarts are faster once weights are on disk. Small dense models (8B and below) load in a minute or two.
+
+---
+
+## Managing models with `deploy.sh`
+
+`deploy.sh` reads **`deploy.conf`** and gives you a single command surface. Only **one model runs at a time**: `up <name>` stops every other configured model first, freeing GPU VRAM for the one you activate.
+
+### Commands
+
+| Command | What it does |
+|---------|--------------|
+| `./deploy.sh` | Print usage + a status table of all configured models (safe no-op). |
+| `./deploy.sh pull [name...]` | Download model(s) into the cache **without serving**. Sequential; continues on failure and reports a summary. |
+| `./deploy.sh up <name>` | Make `<name>` the active model: stop the others, then start it. Reuses an existing stopped container (`docker start`, fast) and falls back to a full recreate via `start.sh --force` if that fails or the container is stale. |
+| `./deploy.sh down [name...]` | Stop model(s). No name = all configured. |
+| `./deploy.sh status` | Show each model's container state and API readiness (`ready(200)` vs `loading(...)`). |
+| `./deploy.sh logs <name>` | Follow the container logs (`docker logs -f`). |
+
+Readiness note: `up` does **not** block until the model finishes loading — it starts the container and returns. Poll `./deploy.sh status` until the model shows `ready(200)`; the API refuses connections (`loading(000)`) until the load completes.
+
+### Configuring models — `deploy.conf`
+
+One `model` line per model:
+
+```bash
+#     name              env vars passed straight to start.sh
+model qwen3.6-35b-a3b   HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B  VLLM_PORT=8000
+model gemma4-e4b        HF_MODEL_ID=google/gemma-4-E4B-it VLLM_PORT=8001 VLLM_QUANTIZATION=
+```
+
+- **`name`** is a handle you invent. It is **both** the argument you type (`up <name>`) **and** the container name in `docker ps`, so make it unique and descriptive — encode family + size + any differentiator so variants don't clash, e.g. `qwen3-8b`, `qwen3.6-35b-a3b`, `gemma4-e4b-fp8`. Allowed characters: letters, digits, `.`, `-`, `_`.
+- **`KEY=VALUE`** pairs are any [environment variables `start.sh` understands](#environment-reference), passed through verbatim. Set at least `HF_MODEL_ID` and a **unique `VLLM_PORT`** per model. `deploy.sh` refuses to load a config with duplicate names or ports.
+- **GPU memory:** because only one model runs at a time, leave `VLLM_GPU_MEMORY_UTILIZATION` unset so each active model gets the full-GPU profile default. Only set it (e.g. `=0.45` on every model) if you deliberately want two models resident at once — expect OOM on a single ~32 GiB Arc with large models.
+- **Gated models** (e.g. `google/gemma-*`) need `HF_TOKEN` exported before `pull`/`up`.
+
+When you need a launch that isn't worth a config entry — a throwaway experiment, an unusual flag combination — call `start.sh` directly instead (next section). `deploy.sh` and `start.sh` are fully interoperable: `deploy.sh up` is essentially `VLLM_CONTAINER_NAME=<name> <config env vars> ./start.sh`.
+
+---
+
+## Running `start.sh` directly (full control)
+
+`deploy.sh` covers the common workflow; drop to `start.sh` when you want to launch a single model with an arbitrary set of overrides. All tuning is via environment variables (see [Environment reference](#environment-reference)):
+
+```bash
+export HF_TOKEN=hf_...   # first download only, if the repo requires it
+HF_MODEL_ID=Qwen/Qwen3-8B VLLM_PORT=8000 ./start.sh
+
+docker logs -f vllm
+no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models
+```
+
+`start.sh` **stops and replaces** the existing container named `vllm` (or whatever you set `VLLM_CONTAINER_NAME` to) — in both the rootless and rootful container stores — and waits for the host port to be released, so you do not need to stop before re-running. To stop it deliberately, run **`./stop.sh`** (respecting the same `VLLM_CONTAINER_NAME`/`VLLM_PORT`). If a port stays stuck, see [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy).
+
+Flags:
+
+- `./start.sh --force` — free a stuck port (kill a leaked container-runtime listener) before starting.
+- `./start.sh --pull-only` — download the model into the cache, then exit without serving. This is exactly what `./deploy.sh pull` calls per model.
+
+The recipes below give explicit, copy-pasteable env blocks for each model size. Any of them can equally become a `deploy.conf` line.
 
 ---
 
@@ -79,6 +140,8 @@ Run the Hermes setup wizard (`hermes setup`, or `sh /home/aibox/hermes-deploy/ru
 ## Recipes by model size
 
 Use **one command block** that matches your model. The API model name is the last segment of `HF_MODEL_ID` (e.g. `Qwen3-8B`, `Qwen3.5-35B-A3B`). Set the same name in `measurement.sh` via `MODEL=`.
+
+Each block runs standalone via `./start.sh`. To make one a managed model, drop the same `KEY=VALUE` overrides onto a `deploy.conf` line (with a unique `name` and `VLLM_PORT`) — see [Configuring models](#configuring-models--deployconf).
 
 ### Qwen3-8B (dense, single Arc), 64k context
 
@@ -312,30 +375,42 @@ That is what the default `start.sh` settings implement for the 35B model.
 
 ## Operations
 
+**Status of all configured models**
+
+```bash
+./deploy.sh status
+```
+
 **Logs**
 
 ```bash
-docker logs -f vllm
+./deploy.sh logs <name>       # e.g. ./deploy.sh logs gemma4-e4b
+docker logs -f <container>    # equivalent; container == the model name
 ```
 
 **Health / model list**
 
 ```bash
-no_proxy=127.0.0.1 curl -s http://127.0.0.1:8000/v1/models | python3 -m json.tool
+no_proxy=127.0.0.1 curl -s http://127.0.0.1:8001/v1/models | python3 -m json.tool
 ```
 
-**Stop (and remove) the container**
+**Stop a model**
 
 ```bash
-./stop.sh          # stop + rm of $VLLM_CONTAINER_NAME (default: vllm); cache untouched
-./stop.sh --force  # also kill a leaked runtime process still holding the port
+./deploy.sh down              # stop all configured models
+./deploy.sh down gemma4-e4b   # stop just one
+
+# Or drop to stop.sh directly (respects VLLM_CONTAINER_NAME / VLLM_PORT):
+./stop.sh                     # stop + rm of $VLLM_CONTAINER_NAME (default: vllm); cache untouched
+./stop.sh --force             # also kill a leaked runtime process still holding the port
 ```
 
-`stop.sh` removes the container from **both** container stores (see below), then
-**verifies port `$VLLM_PORT` was actually released**. It exits non-zero and names
-the process still holding the port instead of reporting a success that did not
-happen. `start.sh` runs the same cleanup as a preflight and refuses to launch
-(rather than failing on the bind) if the port cannot be freed.
+`deploy.sh down` calls `stop.sh` per model. `stop.sh` removes the container from
+**both** container stores (see below), then **verifies port `$VLLM_PORT` was
+actually released**. It exits non-zero and names the process still holding the
+port instead of reporting a success that did not happen. `start.sh` runs the
+same cleanup as a preflight and refuses to launch (rather than failing on the
+bind) if the port cannot be freed.
 
 ### Rootless vs rootful: why the port can stay busy
 
@@ -474,8 +549,10 @@ This measures **end-to-end wall time** for the full response, then divides by `T
 
 | File | Purpose |
 |------|---------|
-| `start.sh` | Download (once) + run vLLM server; frees a stuck port first |
-| `stop.sh` | Stop and remove the vLLM container (keeps the model cache); verifies the port is released |
+| `deploy.sh` | **Primary entrypoint.** Manage/switch the models in `deploy.conf` (`pull` / `up` / `down` / `status` / `logs`); one active at a time |
+| `deploy.conf` | Model registry read by `deploy.sh` — one `model <name> KEY=VALUE...` line per model |
+| `start.sh` | Download (once) + run one vLLM server; frees a stuck port first. `--pull-only` downloads without serving; `--force` frees a stuck port |
+| `stop.sh` | Stop and remove a vLLM container (keeps the model cache); verifies the port is released |
 | `vllm-common.sh` | Shared container/port cleanup helpers sourced by both scripts |
 | `measurement.sh` | Simple throughput test against `/v1/chat/completions` |
 | `llm-scaler-vllm.tar` | Optional offline image load |
