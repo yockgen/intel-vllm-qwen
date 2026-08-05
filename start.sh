@@ -4,7 +4,7 @@
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
-IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:latest}"
+IMAGE="${VLLM_IMAGE:-intel/llm-scaler-vllm:0.21.0-b2}"
 CONTAINER_NAME="${VLLM_CONTAINER_NAME:-vllm}"
 HOST_PORT="${VLLM_PORT:-8000}"
 
@@ -52,18 +52,9 @@ CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
 # override per run with e.g. `VLLM_MAX_MODEL_LEN=8192 ./start.sh`.
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
 VLLM_CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
-# Tensor-parallel size: default to the number of Intel render nodes (/dev/dri/renderD*)
-# so multiple identical GPUs are used automatically. Override with
-# VLLM_TENSOR_PARALLEL_SIZE=N (and optionally ZE_AFFINITY_MASK) to pin a specific count.
-# NOTE: an integrated GPU also exposes a render node; set the value explicitly if the
-# auto-detected count includes an iGPU you do not want to use.
-if [ -z "${VLLM_TENSOR_PARALLEL_SIZE:-}" ]; then
-  _detected_gpus=$(ls -d /dev/dri/renderD* 2>/dev/null | wc -l)
-  [ "${_detected_gpus:-0}" -ge 1 ] || _detected_gpus=1
-  VLLM_TENSOR_PARALLEL_SIZE="$_detected_gpus"
-  [ "$VLLM_TENSOR_PARALLEL_SIZE" -gt 1 ] && \
-    echo "==> Auto-detected $VLLM_TENSOR_PARALLEL_SIZE Intel GPUs; using tensor-parallel-size=$VLLM_TENSOR_PARALLEL_SIZE (override with VLLM_TENSOR_PARALLEL_SIZE=N)"
-fi
+# Tensor-parallel size is explicit: set it in deploy.conf (via deploy.sh) or env.
+# Default remains 1 when not provided.
+VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
 VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT="${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:-1}"
