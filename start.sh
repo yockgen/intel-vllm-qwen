@@ -135,12 +135,21 @@ else
   TARGET_ON_HOST="$CACHE_DIR/config.json"
 fi
 
-echo "==> Load vLLM image from local tarball (if present)"
+echo "==> Ensure vLLM image is available: $IMAGE"
 if [ -f "$DIR/llm-scaler-vllm.tar" ]; then
+  echo "    Loading from local tarball llm-scaler-vllm.tar"
   docker load -i "$DIR/llm-scaler-vllm.tar"
+elif ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  echo "    No tarball and image not local; pulling from registry..."
+  if ! docker pull "$IMAGE"; then
+    echo "ERROR: Could not pull '$IMAGE' from the registry."
+    echo "If this host is offline, provide the image instead:"
+    echo "  place llm-scaler-vllm.tar in $DIR, or: docker load -i <your-export.tar>"
+    exit 1
+  fi
 fi
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
-  echo "ERROR: Container image not found locally: $IMAGE"
+  echo "ERROR: Container image not found locally after load/pull: $IMAGE"
   echo "Place llm-scaler-vllm.tar in $DIR and run again, or: docker load -i <your-export.tar>"
   exit 1
 fi
