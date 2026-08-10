@@ -18,6 +18,7 @@ Under the hood `deploy.sh` calls two lower-level scripts, which you can also run
 - Image `intel/llm-scaler-vllm:latest` locally (or whichever image you set in `VLLM_IMAGE`), or `llm-scaler-vllm.tar` in this directory (loaded automatically)
 - Enough **disk** under `HF_MODEL_CACHE_ROOT` for the chosen model
 - For gated models: `HF_TOKEN` set on first download
+- First Hub download only: outbound network; hosts with **direct** external access may need to [unset corporate proxy](#bypassing-http-proxy-for-downloads) for `pull`/`up` (serve stays offline afterward)
 
 Default image tag in script: `intel/llm-scaler-vllm:latest` (override with `VLLM_IMAGE`). The image is never pulled from a registry — `start.sh` only `docker load`s a local `llm-scaler-vllm.tar` or uses an already-loaded image, then runs everything offline.
 
@@ -64,7 +65,7 @@ First startup of the **35B MoE** can take **20–40+ minutes** (loading shards, 
 |---------|--------------|
 | `./deploy.sh` | Print usage + a status table of all configured models (safe no-op). |
 | `./deploy.sh pull [name...]` | Download model(s) into the cache **without serving**. Sequential; continues on failure and reports a summary. |
-| `./deploy.sh up <name>` | Make `<name>` the active model: stop the others, then start it. Reuses an existing stopped container (`docker start`, fast) and falls back to a full recreate via `start.sh --force` if that fails or the container is stale. |
+| `./deploy.sh up <name>` | Make `<name>` the active model: stop the others, remove any existing container for `<name>`, then recreate it via `start.sh --force` (picks up `deploy.conf` / env changes). |
 | `./deploy.sh down [name...]` | Stop model(s). No name = all configured. |
 | `./deploy.sh status` | Show each model's container state and API readiness (`ready(200)` vs `loading(...)`). |
 | `./deploy.sh logs <name>` | Follow the container logs (`docker logs -f`). |
@@ -537,11 +538,45 @@ This measures **end-to-end wall time** for the full response, then divides by `T
 | `AssertionError` / `checkpoint_fp8_serialized` | Do not use HF `*-FP8` MoE checkpoints on XPU; use full `Qwen3.5-35B-A3B` + online quant |
 | OOM on GPU during inference | Lower `VLLM_MAX_MODEL_LEN`, `VLLM_GPU_MEMORY_UTILIZATION`, or `VLLM_PREFIX_CACHING=0` |
 | OOM on host during load | `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0` (Intel doc tradeoff) or more free RAM |
-| Download fails | Set `HF_TOKEN`; ensure network on first run (download container only) |
+| Download fails | Set `HF_TOKEN` for gated models; ensure network on first run (download container only). If you see `Local entry not found` / `Name or service not known`, see [Bypassing HTTP proxy for downloads](#bypassing-http-proxy-for-downloads) |
 | Image not found | Place `llm-scaler-vllm.tar` here or `docker load -i ...` |
 | `bind: address already in use` after `./stop.sh` | A container in the *other* Podman store (usually root) holds the port. Run `./stop.sh` (now checks both), then `sudo ./stop.sh --force` if it persists. See [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy) |
 | `docker ps` shows nothing but the port is busy | Same rootless/rootful split — check with `sudo docker ps -a` |
 | Server never answers `/v1/models`, log stops after `Loading weights took ...` | Not hung: `sym_int4`/fp8 **online quantization** of a 67 GiB MoE checkpoint runs on CPU for many minutes. Confirm progress with `ps -o %cpu,rss -p $(pgrep -f VLLM::EngineCore)` — high CPU means it is working |
+
+### Bypassing HTTP proxy for downloads
+
+The first-time Hugging Face download runs a short-lived container (`hf download` in `start.sh`). That container **inherits** `http_proxy`, `https_proxy`, and related variables from your shell and from system-wide settings (e.g. `/etc/environment` on Intel-managed hosts). **`start.sh` does not clear them** — many sites require the corporate proxy to reach the Hub.
+
+Some machines sit on a **direct outbound** subnet: they reach the internet without a proxy, but still inherit proxy variables from the image of a standard install. If the proxy hostname is unreachable from that subnet, the download fails with errors such as:
+
+- `Error: Local entry not found`
+- `[Errno -2] Name or service not known`
+
+**What to do (direct-access host, proxy must be bypassed for this run only):**
+
+Unset proxy in the same shell before `pull` or `up`, then run as usual:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+export HF_TOKEN=hf_...   # if the model is gated
+
+./deploy.sh pull gemma4-e4b
+# or
+./deploy.sh up gemma4-e4b
+```
+
+One-shot without changing your shell:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u ALL_PROXY -u all_proxy \
+    HF_TOKEN=hf_... ./deploy.sh up gemma4-e4b
+```
+
+After weights are cached, the serve container runs with `HF_HUB_OFFLINE=1` and does not need Hub access or proxy tuning for normal operation.
+
+**What to do (proxy required):** leave `http_proxy` / `https_proxy` set as your site expects; ensure the proxy hostname resolves and allows `huggingface.co`. Use `HF_TOKEN` for gated models.
 
 ---
 
