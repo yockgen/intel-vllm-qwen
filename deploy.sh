@@ -130,19 +130,13 @@ cmd_up() {
     run_stop "$idx" >/dev/null 2>&1 || true
   done
 
-  # Try a fast reuse first (start an existing stopped container), then fall back
-  # to a full recreate via start.sh if reuse fails or the container is broken.
+  # Always recreate via start.sh so deploy.conf / env changes apply. Reusing a
+  # stopped container with `docker start` skips start.sh and can leave stale flags.
   echo "==> Activating '${MODEL_NAMES[target]}' (port ${MODEL_PORTS[target]:-8000})"
   if "$DOCKER_BIN" container inspect "${MODEL_NAMES[target]}" >/dev/null 2>&1; then
-    echo "    existing container found — trying 'docker start' (fast, reloads model)"
-    if "$DOCKER_BIN" start "${MODEL_NAMES[target]}" >/dev/null 2>&1; then
-      echo "    started existing container '${MODEL_NAMES[target]}'."
-      echo "    (model reload takes minutes; check: ./deploy.sh status)"
-      return 0
-    fi
-    echo "    'docker start' failed or container is stale — recreating via start.sh."
+    echo "    existing container found — removing and recreating via start.sh"
+    run_stop "$target" --force || true
   fi
-  # Recreate. --force clears a stuck port/leaked listener (the crun-stale case).
   run_start "$target" --force
 }
 
