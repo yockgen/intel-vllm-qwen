@@ -52,8 +52,9 @@ CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
 # override per run with e.g. `VLLM_MAX_MODEL_LEN=8192 ./start.sh`.
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
 VLLM_CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
-# Tensor-parallel size is explicit: set it in deploy.conf (via deploy.sh) or env.
-# Default remains 1 when not provided.
+# Track whether the user supplied TP size; if not, auto-detect after model is cached.
+_tp_user_set=0
+[ -n "${VLLM_TENSOR_PARALLEL_SIZE+x}" ] && _tp_user_set=1
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
@@ -208,6 +209,74 @@ model_cached() {
   return 1
 }
 
+# Auto-set VLLM_TENSOR_PARALLEL_SIZE from GPU VRAM and model disk size.
+# Requires: CACHE_DIR, /dev/dri/renderD* devices, xpu-smi (optional).
+_auto_tensor_parallel() {
+  echo "==> Auto-detecting VLLM_TENSOR_PARALLEL_SIZE (not set by user)..."
+
+  # Count GPUs from render nodes (renderD128, renderD129, …)
+  local gpu_count
+  gpu_count=$(ls /dev/dri/renderD* 2>/dev/null | wc -l)
+  if [ "$gpu_count" -le 0 ]; then
+    echo "    No /dev/dri/renderD* devices found; defaulting to tp=1."
+    VLLM_TENSOR_PARALLEL_SIZE=1; return
+  fi
+  echo "    Detected $gpu_count XPU GPU(s)"
+
+  # Per-GPU VRAM (MiB) via xpu-smi JSON; fall back to 32 GiB assumption
+  local vram_mib=0
+  if command -v xpu-smi >/dev/null 2>&1; then
+    vram_mib=$(xpu-smi discovery --json 2>/dev/null | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    for dev in (d.get('device_list') or []):
+        mem = (dev.get('memory_physical_size_byte') or
+               dev.get('mem_physical_size_byte') or
+               dev.get('memory_size_byte') or 0)
+        if mem:
+            print(int(mem) // 1024 // 1024)
+            break
+    else:
+        print(0)
+except Exception:
+    print(0)
+" 2>/dev/null) || vram_mib=0
+  fi
+  if [ "${vram_mib:-0}" -le 0 ]; then
+    echo "    VRAM detection via xpu-smi failed; assuming 32 GiB per GPU."
+    vram_mib=32768
+  else
+    echo "    VRAM per GPU: $((vram_mib / 1024)) GiB"
+  fi
+
+  # Model size (MiB) from local cache directory
+  local model_mib=0
+  if [ -d "$CACHE_DIR" ]; then
+    model_mib=$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1) || model_mib=0
+  fi
+  if [ "${model_mib:-0}" -le 0 ]; then
+    echo "    Model cache empty or missing; defaulting to tp=1."
+    VLLM_TENSOR_PARALLEL_SIZE=1; return
+  fi
+  echo "    Model size on disk: ${model_mib} MiB ($((model_mib / 1024)) GiB)"
+
+  # Minimum GPUs = ceil(model_MiB / (vram_MiB * 0.90)), reserving 10% for KV cache
+  local tp
+  tp=$(python3 -c "
+import math
+print(max(1, math.ceil($model_mib / ($vram_mib * 0.90))))
+" 2>/dev/null) || tp=1
+
+  if [ "$tp" -gt "$gpu_count" ]; then
+    echo "    WARNING: model needs ~${tp} GPUs but only $gpu_count available; capping."
+    tp="$gpu_count"
+  fi
+
+  VLLM_TENSOR_PARALLEL_SIZE="$tp"
+  echo "    Auto-set VLLM_TENSOR_PARALLEL_SIZE=$VLLM_TENSOR_PARALLEL_SIZE"
+}
+
 echo "==> HuggingFace model cache: $CACHE_DIR"
 [ -n "$HF_GGUF_FILE" ] && echo "    GGUF file: $HF_GGUF_FILE"
 mkdir -p "$HF_MODEL_CACHE_ROOT"
@@ -247,6 +316,11 @@ fi
 if [ "$PULL_ONLY" = 1 ]; then
   echo "==> Pull-only: model is cached at $CACHE_DIR (not serving)."
   exit 0
+fi
+
+# Auto-detect TP size now that the model is guaranteed to be on disk.
+if [ "$_tp_user_set" = 0 ]; then
+  _auto_tensor_parallel
 fi
 
 echo "==> Start container ($IMAGE) with $MODEL_IN_CONTAINER"
@@ -289,6 +363,28 @@ OFFLOAD_QUANT_ENV=()
 if [ -n "$VLLM_QUANTIZATION" ]; then
   OFFLOAD_QUANT_ENV=(-e "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT}")
 fi
+
+# Apply hardware profile defaults (VLLM_HW_PROFILE=non-P2P, etc.)
+# shellcheck source=hw-profiles.conf
+. "$DIR/hw-profiles.conf"
+
+_apply_hw_profile() {
+  local profile="$1"
+  [ -z "$profile" ] && return 0
+  local array_var="profile_${profile//-/_}_vars"
+  if declare -p "$array_var" >/dev/null 2>&1; then
+    eval "local -a arr=(\"\${${array_var}[@]}\")"
+    for item in "${arr[@]}"; do
+      # Only set if not already in environment
+      local key="${item%%=*}" val="${item#*=}"
+      eval "${key}=\"\${${key}:-${val}}\""
+    done
+  else
+    echo "WARNING: unknown VLLM_HW_PROFILE='$profile' — no hardware defaults applied." >&2
+  fi
+}
+_apply_hw_profile "${VLLM_HW_PROFILE:-}"
+
 ZE_ENV=()
 if [ -n "${ZE_AFFINITY_MASK:-}" ]; then
   ZE_ENV=(-e "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}")
