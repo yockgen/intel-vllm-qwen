@@ -82,8 +82,16 @@ model qwen3.6-35b-a3b   HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B  VLLM_PORT=8000
 model gemma4-e4b        HF_MODEL_ID=google/gemma-4-E4B-it VLLM_PORT=8001 VLLM_QUANTIZATION=
 ```
 
+For multi-GPU models, add the GPU-selection variables on the same line. `ZE_AFFINITY_MASK` is optional: if you leave it unset, the container can see all GPUs and vLLM will use as many as `VLLM_TENSOR_PARALLEL_SIZE` requests. Example for two pinned GPUs:
+
+```bash
+model qwen3.6-35b-a3b-tp2 HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B VLLM_PORT=8004 VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1
+```
+
 - **`name`** is a handle you invent. It is **both** the argument you type (`up <name>`) **and** the container name in `docker ps`, so make it unique and descriptive — encode family + size + any differentiator so variants don't clash, e.g. `qwen3-8b`, `qwen3.6-35b-a3b`, `gemma4-e4b-fp8`. Allowed characters: letters, digits, `.`, `-`, `_`.
 - **`KEY=VALUE`** pairs are any [environment variables `start.sh` understands](#environment-reference), passed through verbatim. Set at least `HF_MODEL_ID` and a **unique `VLLM_PORT`** per model. `deploy.sh` refuses to load a config with duplicate names or ports.
+- **Multi-GPU:** set `VLLM_TENSOR_PARALLEL_SIZE` to the number of GPUs the model should use. Set `ZE_AFFINITY_MASK` only when you want to pin specific GPU indices, for example `VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1` for GPUs 0 and 1. If `ZE_AFFINITY_MASK` is unset, all visible GPUs remain available and vLLM uses the count requested by `VLLM_TENSOR_PARALLEL_SIZE`. `start.sh` defaults `VLLM_TENSOR_PARALLEL_SIZE` to `1`, so you must override it for multi-GPU launches.
+- **No P2P between selected GPUs:** if peer-to-peer is **not** supported between those GPUs, also set `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLTOALL_TMP_BUF=1`. If P2P **is** supported, leave all four unset.
 - **GPU memory:** because only one model runs at a time, leave `VLLM_GPU_MEMORY_UTILIZATION` unset so each active model gets the full-GPU profile default. Only set it (e.g. `=0.45` on every model) if you deliberately want two models resident at once — expect OOM on a single ~32 GiB Arc with large models.
 - **Gated models** (e.g. `google/gemma-*`) need `HF_TOKEN` exported before `pull`/`up`.
 
@@ -271,13 +279,31 @@ VLLM_ENFORCE_EAGER=1 \
 ./start.sh
 ```
 
+Set `VLLM_TENSOR_PARALLEL_SIZE` to however many GPUs you want vLLM to split across. Set `ZE_AFFINITY_MASK` only if you want to limit the container to specific GPU indices; otherwise leave it unset and the default visible GPU set is used. For example:
+
+- `VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1` uses GPUs 0 and 1.
+- `VLLM_TENSOR_PARALLEL_SIZE=3 ZE_AFFINITY_MASK=0,1,2` uses GPUs 0, 1, and 2.
+- `VLLM_TENSOR_PARALLEL_SIZE=2` with no `ZE_AFFINITY_MASK` uses any two GPUs from the default visible set.
+
+If the selected GPUs do **not** support P2P, add this CCL fallback block:
+
+```bash
+CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_ALLTOALL_TMP_BUF=1
+```
+
+If P2P **is** supported, leave those `CCL_SYCL_*` variables unset.
+
 | Variable | Value | Why |
 |----------|--------|-----|
 | `VLLM_TENSOR_PARALLEL_SIZE` | `2` | Split model across 2 XPUs |
 | `ZE_AFFINITY_MASK` | `0,1` | Bind to first two Arc devices |
+| `CCL_SYCL_*` fallback block | set only when P2P is unavailable | Forces the safer collective path on systems without GPU peer-to-peer |
 | `VLLM_MAX_MODEL_LEN` | higher (e.g. `16384`–`40000`) | More KV cache possible with 2 GPUs |
 
-Adjust `ZE_AFFINITY_MASK` to match your `renderD*` / GPU indices.
+Adjust `ZE_AFFINITY_MASK` to match your `renderD*` / GPU indices, and keep its GPU count aligned with `VLLM_TENSOR_PARALLEL_SIZE`.
 
 ---
 
@@ -331,7 +357,11 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of XPU memory for weights + KV cache |
 | `VLLM_CPU_OFFLOAD_GB` | `0` | vLLM `--cpu-offload-gb`; **not recommended** for Qwen3.5 MoE on XPU |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of XPUs (`--tensor-parallel-size`) |
-| `ZE_AFFINITY_MASK` | *(unset)* | e.g. `0,1` for two GPUs |
+| `ZE_AFFINITY_MASK` | *(unset)* | Optional GPU pinning mask; leave unset to use the default visible GPU set |
+| `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_ALLTOALL_TMP_BUF` | *(unset)* | Set to `1` only when multi-GPU P2P is not supported |
 
 ### vLLM serve tuning
 
