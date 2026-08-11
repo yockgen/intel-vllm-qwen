@@ -18,6 +18,7 @@ Under the hood `deploy.sh` calls two lower-level scripts, which you can also run
 - Image `intel/llm-scaler-vllm:latest` locally (or whichever image you set in `VLLM_IMAGE`), or `llm-scaler-vllm.tar` in this directory (loaded automatically)
 - Enough **disk** under `HF_MODEL_CACHE_ROOT` for the chosen model
 - For gated models: `HF_TOKEN` set on first download
+- First Hub download only: outbound network; hosts with **direct** external access may need to [unset corporate proxy](#bypassing-http-proxy-for-downloads) for `pull`/`up` (serve stays offline afterward)
 
 Default image tag in script: `intel/llm-scaler-vllm:latest` (override with `VLLM_IMAGE`). The image is never pulled from a registry — `start.sh` only `docker load`s a local `llm-scaler-vllm.tar` or uses an already-loaded image, then runs everything offline.
 
@@ -64,7 +65,7 @@ First startup of the **35B MoE** can take **20–40+ minutes** (loading shards, 
 |---------|--------------|
 | `./deploy.sh` | Print usage + a status table of all configured models (safe no-op). |
 | `./deploy.sh pull [name...]` | Download model(s) into the cache **without serving**. Sequential; continues on failure and reports a summary. |
-| `./deploy.sh up <name>` | Make `<name>` the active model: stop the others, then start it. Reuses an existing stopped container (`docker start`, fast) and falls back to a full recreate via `start.sh --force` if that fails or the container is stale. |
+| `./deploy.sh up <name>` | Make `<name>` the active model: stop the others, remove any existing container for `<name>`, then recreate it via `start.sh --force` (picks up `deploy.conf` / env changes). |
 | `./deploy.sh down [name...]` | Stop model(s). No name = all configured. |
 | `./deploy.sh status` | Show each model's container state and API readiness (`ready(200)` vs `loading(...)`). |
 | `./deploy.sh logs <name>` | Follow the container logs (`docker logs -f`). |
@@ -81,8 +82,16 @@ model qwen3.6-35b-a3b   HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B  VLLM_PORT=8000
 model gemma4-e4b        HF_MODEL_ID=google/gemma-4-E4B-it VLLM_PORT=8001 VLLM_QUANTIZATION=
 ```
 
+For multi-GPU models, add the GPU-selection variables on the same line. `ZE_AFFINITY_MASK` is optional: if you leave it unset, the container can see all GPUs and vLLM will use as many as `VLLM_TENSOR_PARALLEL_SIZE` requests. Example for two pinned GPUs:
+
+```bash
+model qwen3.6-35b-a3b-tp2 HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B VLLM_PORT=8004 VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1
+```
+
 - **`name`** is a handle you invent. It is **both** the argument you type (`up <name>`) **and** the container name in `docker ps`, so make it unique and descriptive — encode family + size + any differentiator so variants don't clash, e.g. `qwen3-8b`, `qwen3.6-35b-a3b`, `gemma4-e4b-fp8`. Allowed characters: letters, digits, `.`, `-`, `_`.
 - **`KEY=VALUE`** pairs are any [environment variables `start.sh` understands](#environment-reference), passed through verbatim. Set at least `HF_MODEL_ID` and a **unique `VLLM_PORT`** per model. `deploy.sh` refuses to load a config with duplicate names or ports.
+- **Multi-GPU:** set `VLLM_TENSOR_PARALLEL_SIZE` to the number of GPUs the model should use. Set `ZE_AFFINITY_MASK` only when you want to pin specific GPU indices, for example `VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1` for GPUs 0 and 1. If `ZE_AFFINITY_MASK` is unset, all visible GPUs remain available and vLLM uses the count requested by `VLLM_TENSOR_PARALLEL_SIZE`. `start.sh` defaults `VLLM_TENSOR_PARALLEL_SIZE` to `1`, so you must override it for multi-GPU launches.
+- **No P2P between selected GPUs:** if peer-to-peer is **not** supported between those GPUs, also set `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLTOALL_TMP_BUF=1`. If P2P **is** supported, leave all four unset.
 - **GPU memory:** because only one model runs at a time, leave `VLLM_GPU_MEMORY_UTILIZATION` unset so each active model gets the full-GPU profile default. Only set it (e.g. `=0.45` on every model) if you deliberately want two models resident at once — expect OOM on a single ~32 GiB Arc with large models.
 - **Gated models** (e.g. `google/gemma-*`) need `HF_TOKEN` exported before `pull`/`up`.
 
@@ -270,13 +279,31 @@ VLLM_ENFORCE_EAGER=1 \
 ./start.sh
 ```
 
+Set `VLLM_TENSOR_PARALLEL_SIZE` to however many GPUs you want vLLM to split across. Set `ZE_AFFINITY_MASK` only if you want to limit the container to specific GPU indices; otherwise leave it unset and the default visible GPU set is used. For example:
+
+- `VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1` uses GPUs 0 and 1.
+- `VLLM_TENSOR_PARALLEL_SIZE=3 ZE_AFFINITY_MASK=0,1,2` uses GPUs 0, 1, and 2.
+- `VLLM_TENSOR_PARALLEL_SIZE=2` with no `ZE_AFFINITY_MASK` uses any two GPUs from the default visible set.
+
+If the selected GPUs do **not** support P2P, add this CCL fallback block:
+
+```bash
+CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 \
+CCL_SYCL_ALLTOALL_TMP_BUF=1
+```
+
+If P2P **is** supported, leave those `CCL_SYCL_*` variables unset.
+
 | Variable | Value | Why |
 |----------|--------|-----|
 | `VLLM_TENSOR_PARALLEL_SIZE` | `2` | Split model across 2 XPUs |
 | `ZE_AFFINITY_MASK` | `0,1` | Bind to first two Arc devices |
+| `CCL_SYCL_*` fallback block | set only when P2P is unavailable | Forces the safer collective path on systems without GPU peer-to-peer |
 | `VLLM_MAX_MODEL_LEN` | higher (e.g. `16384`–`40000`) | More KV cache possible with 2 GPUs |
 
-Adjust `ZE_AFFINITY_MASK` to match your `renderD*` / GPU indices.
+Adjust `ZE_AFFINITY_MASK` to match your `renderD*` / GPU indices, and keep its GPU count aligned with `VLLM_TENSOR_PARALLEL_SIZE`.
 
 ---
 
@@ -330,7 +357,11 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of XPU memory for weights + KV cache |
 | `VLLM_CPU_OFFLOAD_GB` | `0` | vLLM `--cpu-offload-gb`; **not recommended** for Qwen3.5 MoE on XPU |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of XPUs (`--tensor-parallel-size`) |
-| `ZE_AFFINITY_MASK` | *(unset)* | e.g. `0,1` for two GPUs |
+| `ZE_AFFINITY_MASK` | *(unset)* | Optional GPU pinning mask; leave unset to use the default visible GPU set |
+| `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_ALLTOALL_TMP_BUF` | *(unset)* | Set to `1` only when multi-GPU P2P is not supported |
 
 ### vLLM serve tuning
 
@@ -537,11 +568,45 @@ This measures **end-to-end wall time** for the full response, then divides by `T
 | `AssertionError` / `checkpoint_fp8_serialized` | Do not use HF `*-FP8` MoE checkpoints on XPU; use full `Qwen3.5-35B-A3B` + online quant |
 | OOM on GPU during inference | Lower `VLLM_MAX_MODEL_LEN`, `VLLM_GPU_MEMORY_UTILIZATION`, or `VLLM_PREFIX_CACHING=0` |
 | OOM on host during load | `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=0` (Intel doc tradeoff) or more free RAM |
-| Download fails | Set `HF_TOKEN`; ensure network on first run (download container only) |
+| Download fails | Set `HF_TOKEN` for gated models; ensure network on first run (download container only). If you see `Local entry not found` / `Name or service not known`, see [Bypassing HTTP proxy for downloads](#bypassing-http-proxy-for-downloads) |
 | Image not found | Place `llm-scaler-vllm.tar` here or `docker load -i ...` |
 | `bind: address already in use` after `./stop.sh` | A container in the *other* Podman store (usually root) holds the port. Run `./stop.sh` (now checks both), then `sudo ./stop.sh --force` if it persists. See [Rootless vs rootful](#rootless-vs-rootful-why-the-port-can-stay-busy) |
 | `docker ps` shows nothing but the port is busy | Same rootless/rootful split — check with `sudo docker ps -a` |
 | Server never answers `/v1/models`, log stops after `Loading weights took ...` | Not hung: `sym_int4`/fp8 **online quantization** of a 67 GiB MoE checkpoint runs on CPU for many minutes. Confirm progress with `ps -o %cpu,rss -p $(pgrep -f VLLM::EngineCore)` — high CPU means it is working |
+
+### Bypassing HTTP proxy for downloads
+
+The first-time Hugging Face download runs a short-lived container (`hf download` in `start.sh`). That container **inherits** `http_proxy`, `https_proxy`, and related variables from your shell and from system-wide settings (e.g. `/etc/environment` on Intel-managed hosts). **`start.sh` does not clear them** — many sites require the corporate proxy to reach the Hub.
+
+Some machines sit on a **direct outbound** subnet: they reach the internet without a proxy, but still inherit proxy variables from the image of a standard install. If the proxy hostname is unreachable from that subnet, the download fails with errors such as:
+
+- `Error: Local entry not found`
+- `[Errno -2] Name or service not known`
+
+**What to do (direct-access host, proxy must be bypassed for this run only):**
+
+Unset proxy in the same shell before `pull` or `up`, then run as usual:
+
+```bash
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+export HF_TOKEN=hf_...   # if the model is gated
+
+./deploy.sh pull gemma4-e4b
+# or
+./deploy.sh up gemma4-e4b
+```
+
+One-shot without changing your shell:
+
+```bash
+env -u http_proxy -u https_proxy -u HTTP_PROXY -u HTTPS_PROXY \
+    -u ALL_PROXY -u all_proxy \
+    HF_TOKEN=hf_... ./deploy.sh up gemma4-e4b
+```
+
+After weights are cached, the serve container runs with `HF_HUB_OFFLINE=1` and does not need Hub access or proxy tuning for normal operation.
+
+**What to do (proxy required):** leave `http_proxy` / `https_proxy` set as your site expects; ensure the proxy hostname resolves and allows `huggingface.co`. Use `HF_TOKEN` for gated models.
 
 ---
 
