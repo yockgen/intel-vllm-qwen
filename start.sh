@@ -385,8 +385,22 @@ _apply_hw_profile() {
 }
 _resolved_hw_profile="${VLLM_HW_PROFILE:-}"
 if [ -z "$_resolved_hw_profile" ] && [ "${VLLM_TENSOR_PARALLEL_SIZE:-1}" -gt 1 ]; then
-  _resolved_hw_profile="non-P2P"
-  echo "==> Auto-select hardware profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+  p2p_checker="$DIR/check_p2p_support.sh"
+  if [ -x "$p2p_checker" ]; then
+    echo "==> Checking host P2P capability via $p2p_checker"
+    p2p_result="$($p2p_checker 2>&1 || true)"
+    printf '%s\n' "$p2p_result" | sed 's/^/    /'
+
+    if printf '%s\n' "$p2p_result" | grep -q "P2P_SUPPORTED"; then
+      echo "==> P2P supported: no non-P2P hardware profile applied"
+    else
+      _resolved_hw_profile="non-P2P"
+      echo "==> Auto-select hardware profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+    fi
+  else
+    _resolved_hw_profile="non-P2P"
+    echo "==> P2P checker not found; fallback profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+  fi
 fi
 _apply_hw_profile "$_resolved_hw_profile"
 
