@@ -383,7 +383,12 @@ _apply_hw_profile() {
     echo "WARNING: unknown VLLM_HW_PROFILE='$profile' — no hardware defaults applied." >&2
   fi
 }
-_apply_hw_profile "${VLLM_HW_PROFILE:-}"
+_resolved_hw_profile="${VLLM_HW_PROFILE:-}"
+if [ -z "$_resolved_hw_profile" ] && [ "${VLLM_TENSOR_PARALLEL_SIZE:-1}" -gt 1 ]; then
+  _resolved_hw_profile="non-P2P"
+  echo "==> Auto-select hardware profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+fi
+_apply_hw_profile "$_resolved_hw_profile"
 
 ZE_ENV=()
 if [ -n "${ZE_AFFINITY_MASK:-}" ]; then

@@ -91,7 +91,12 @@ model qwen3.6-35b-a3b-tp2 HF_MODEL_ID=Qwen/Qwen3.6-35B-A3B VLLM_PORT=8004 VLLM_T
 - **`name`** is a handle you invent. It is **both** the argument you type (`up <name>`) **and** the container name in `docker ps`, so make it unique and descriptive — encode family + size + any differentiator so variants don't clash, e.g. `qwen3-8b`, `qwen3.6-35b-a3b`, `gemma4-e4b-fp8`. Allowed characters: letters, digits, `.`, `-`, `_`.
 - **`KEY=VALUE`** pairs are any [environment variables `start.sh` understands](#environment-reference), passed through verbatim. Set at least `HF_MODEL_ID` and a **unique `VLLM_PORT`** per model. `deploy.sh` refuses to load a config with duplicate names or ports.
 - **Multi-GPU:** set `VLLM_TENSOR_PARALLEL_SIZE` to the number of GPUs the model should use. Set `ZE_AFFINITY_MASK` only when you want to pin specific GPU indices, for example `VLLM_TENSOR_PARALLEL_SIZE=2 ZE_AFFINITY_MASK=0,1` for GPUs 0 and 1. If `ZE_AFFINITY_MASK` is unset, all visible GPUs remain available and vLLM uses the count requested by `VLLM_TENSOR_PARALLEL_SIZE`. `start.sh` defaults `VLLM_TENSOR_PARALLEL_SIZE` to `1`, so you must override it for multi-GPU launches.
-- **No P2P between selected GPUs:** if peer-to-peer is **not** supported between those GPUs, also set `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296 CCL_SYCL_ALLTOALL_TMP_BUF=1`. If P2P **is** supported, leave all four unset.
+- **No P2P between selected GPUs (new default behavior):** when `VLLM_TENSOR_PARALLEL_SIZE>1` and `VLLM_HW_PROFILE` is unset, `start.sh` now auto-selects `VLLM_HW_PROFILE=non-P2P`, which applies:
+  `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296`
+  `CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD=4294967296`
+  `CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD=4294967296`
+  `CCL_SYCL_ALLTOALL_TMP_BUF=1`
+  You can still override any of these explicitly in `deploy.conf`/env. To force a different profile selection policy, set `VLLM_HW_PROFILE` yourself.
 - **GPU memory:** because only one model runs at a time, leave `VLLM_GPU_MEMORY_UTILIZATION` unset so each active model gets the full-GPU profile default. Only set it (e.g. `=0.45` on every model) if you deliberately want two models resident at once — expect OOM on a single ~32 GiB Arc with large models.
 - **Gated models** (e.g. `google/gemma-*`) need `HF_TOKEN` exported before `pull`/`up`.
 
@@ -285,7 +290,7 @@ Set `VLLM_TENSOR_PARALLEL_SIZE` to however many GPUs you want vLLM to split acro
 - `VLLM_TENSOR_PARALLEL_SIZE=3 ZE_AFFINITY_MASK=0,1,2` uses GPUs 0, 1, and 2.
 - `VLLM_TENSOR_PARALLEL_SIZE=2` with no `ZE_AFFINITY_MASK` uses any two GPUs from the default visible set.
 
-If the selected GPUs do **not** support P2P, add this CCL fallback block:
+If the selected GPUs do **not** support P2P, this CCL fallback block is now applied automatically by default when `VLLM_TENSOR_PARALLEL_SIZE>1` (unless you set `VLLM_HW_PROFILE` explicitly):
 
 ```bash
 CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD=4294967296 \
@@ -357,11 +362,12 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of XPU memory for weights + KV cache |
 | `VLLM_CPU_OFFLOAD_GB` | `0` | vLLM `--cpu-offload-gb`; **not recommended** for Qwen3.5 MoE on XPU |
 | `VLLM_TENSOR_PARALLEL_SIZE` | `1` | Number of XPUs (`--tensor-parallel-size`) |
+| `VLLM_HW_PROFILE` | *(unset)* | Hardware profile from `hw-profiles.conf`. If unset and `VLLM_TENSOR_PARALLEL_SIZE>1`, `start.sh` auto-selects `non-P2P` |
 | `ZE_AFFINITY_MASK` | *(unset)* | Optional GPU pinning mask; leave unset to use the default visible GPU set |
-| `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
-| `CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
-| `CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD` | *(unset)* | Set to `4294967296` only when multi-GPU P2P is not supported |
-| `CCL_SYCL_ALLTOALL_TMP_BUF` | *(unset)* | Set to `1` only when multi-GPU P2P is not supported |
+| `CCL_SYCL_ALLREDUCE_SIMPLE_THRESHOLD` | *(profile/env)* | Comes from `non-P2P` profile by default for TP>1; set explicitly to override |
+| `CCL_SYCL_REDUCE_SCATTER_SIMPLE_THRESHOLD` | *(profile/env)* | Comes from `non-P2P` profile by default for TP>1; set explicitly to override |
+| `CCL_SYCL_ALLGATHERV_SIMPLE_THRESHOLD` | *(profile/env)* | Comes from `non-P2P` profile by default for TP>1; set explicitly to override |
+| `CCL_SYCL_ALLTOALL_TMP_BUF` | *(profile/env)* | Comes from `non-P2P` profile by default for TP>1; set explicitly to override |
 
 ### vLLM serve tuning
 
