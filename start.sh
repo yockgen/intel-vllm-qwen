@@ -210,7 +210,7 @@ model_cached() {
 }
 
 # Auto-set VLLM_TENSOR_PARALLEL_SIZE from GPU VRAM and model disk size.
-# Requires: CACHE_DIR, /dev/dri/renderD* devices, xpu-smi (optional).
+# Requires: CACHE_DIR, /dev/dri/renderD* devices, check_vram_ze_peak.sh.
 _auto_tensor_parallel() {
   echo "==> Auto-detecting VLLM_TENSOR_PARALLEL_SIZE (not set by user)..."
 
@@ -223,82 +223,27 @@ _auto_tensor_parallel() {
   fi
   echo "    Detected $gpu_count XPU GPU(s)"
 
-  # Per-GPU VRAM (MiB): xpu-smi first, then sysfs, then 32 GiB fallback.
+  # Per-GPU VRAM (MiB): prefer ze_peak helper script, then 32 GiB fallback.
   local vram_mib=0
   local vram_source=""
+  local vram_checker="$DIR/check_vram_ze_peak.sh"
+  local checker_output=""
 
-  if command -v xpu-smi >/dev/null 2>&1; then
-    vram_mib=$(xpu-smi discovery --json 2>/dev/null | python3 -c "
-import json, sys
-
-def walk(obj):
-    if isinstance(obj, dict):
-        yield obj
-        for v in obj.values():
-            yield from walk(v)
-    elif isinstance(obj, list):
-        for v in obj:
-            yield from walk(v)
-
-keys = {
-    'memory_physical_size_byte',
-    'mem_physical_size_byte',
-    'memory_size_byte',
-    'local_memory_size_byte',
-    'local_mem_size_byte',
-}
-
-try:
-    d = json.load(sys.stdin)
-except Exception:
-    print(0)
-    raise SystemExit(0)
-
-vals = []
-for node in walk(d):
-    for k in keys:
-        v = node.get(k)
-        if isinstance(v, (int, float)) and v > 0:
-            vals.append(int(v) // 1024 // 1024)
-
-print(min(vals) if vals else 0)
-" 2>/dev/null) || vram_mib=0
-
-    if [ "${vram_mib:-0}" -gt 0 ]; then
-      vram_source="xpu-smi"
+  if [ -f "$vram_checker" ]; then
+    checker_output="$(bash "$vram_checker" 2>&1 || true)"
+    printf '%s\n' "$checker_output" | sed 's/^/    [ze_peak] /'
+    vram_mib="$(printf '%s\n' "$checker_output" | sed -n 's/^VLLM_VRAM_MIB_RECOMMENDED=\([0-9][0-9]*\)$/\1/p' | tail -n 1)"
+    if [[ "${vram_mib:-}" =~ ^[0-9]+$ ]] && [ "$vram_mib" -gt 0 ]; then
+      vram_source="ze_peak"
+    else
+      vram_mib=0
     fi
+  else
+    echo "    VRAM checker script not found: $vram_checker"
   fi
 
   if [ "${vram_mib:-0}" -le 0 ]; then
-    local sysfs_path bytes mib
-    for sysfs_path in \
-      /sys/class/drm/card*/device/mem_info_vram_total \
-      /sys/class/drm/card*/device/mem_info_vram_total_bytes \
-      /sys/class/drm/card*/device/lmem_total_bytes \
-      /sys/class/drm/card*/device/local_memory_bytes \
-      /sys/class/drm/renderD*/device/mem_info_vram_total \
-      /sys/class/drm/renderD*/device/mem_info_vram_total_bytes \
-      /sys/class/drm/renderD*/device/lmem_total_bytes \
-      /sys/class/drm/renderD*/device/local_memory_bytes; do
-      [ -e "$sysfs_path" ] || continue
-      [ -r "$sysfs_path" ] || continue
-      bytes="$(cat "$sysfs_path" 2>/dev/null || echo 0)"
-      [[ "$bytes" =~ ^[0-9]+$ ]] || continue
-      [ "$bytes" -gt 0 ] || continue
-      mib=$((bytes / 1024 / 1024))
-      [ "$mib" -gt 0 ] || continue
-      if [ "$vram_mib" -eq 0 ] || [ "$mib" -lt "$vram_mib" ]; then
-        vram_mib="$mib"
-      fi
-    done
-
-    if [ "${vram_mib:-0}" -gt 0 ]; then
-      vram_source="sysfs"
-    fi
-  fi
-
-  if [ "${vram_mib:-0}" -le 0 ]; then
-    echo "    VRAM detection failed via xpu-smi and sysfs; assuming 32 GiB per GPU."
+    echo "    VRAM detection failed via ze_peak checker; assuming 32 GiB per GPU."
     vram_mib=32768
     vram_source="assumed"
   fi
