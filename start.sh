@@ -223,32 +223,87 @@ _auto_tensor_parallel() {
   fi
   echo "    Detected $gpu_count XPU GPU(s)"
 
-  # Per-GPU VRAM (MiB) via xpu-smi JSON; fall back to 32 GiB assumption
+  # Per-GPU VRAM (MiB): xpu-smi first, then sysfs, then 32 GiB fallback.
   local vram_mib=0
+  local vram_source=""
+
   if command -v xpu-smi >/dev/null 2>&1; then
     vram_mib=$(xpu-smi discovery --json 2>/dev/null | python3 -c "
 import json, sys
+
+def walk(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from walk(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from walk(v)
+
+keys = {
+    'memory_physical_size_byte',
+    'mem_physical_size_byte',
+    'memory_size_byte',
+    'local_memory_size_byte',
+    'local_mem_size_byte',
+}
+
 try:
     d = json.load(sys.stdin)
-    for dev in (d.get('device_list') or []):
-        mem = (dev.get('memory_physical_size_byte') or
-               dev.get('mem_physical_size_byte') or
-               dev.get('memory_size_byte') or 0)
-        if mem:
-            print(int(mem) // 1024 // 1024)
-            break
-    else:
-        print(0)
 except Exception:
     print(0)
+    raise SystemExit(0)
+
+vals = []
+for node in walk(d):
+    for k in keys:
+        v = node.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            vals.append(int(v) // 1024 // 1024)
+
+print(min(vals) if vals else 0)
 " 2>/dev/null) || vram_mib=0
+
+    if [ "${vram_mib:-0}" -gt 0 ]; then
+      vram_source="xpu-smi"
+    fi
   fi
+
   if [ "${vram_mib:-0}" -le 0 ]; then
-    echo "    VRAM detection via xpu-smi failed; assuming 32 GiB per GPU."
-    vram_mib=32768
-  else
-    echo "    VRAM per GPU: $((vram_mib / 1024)) GiB"
+    local sysfs_path bytes mib
+    for sysfs_path in \
+      /sys/class/drm/card*/device/mem_info_vram_total \
+      /sys/class/drm/card*/device/mem_info_vram_total_bytes \
+      /sys/class/drm/card*/device/lmem_total_bytes \
+      /sys/class/drm/card*/device/local_memory_bytes \
+      /sys/class/drm/renderD*/device/mem_info_vram_total \
+      /sys/class/drm/renderD*/device/mem_info_vram_total_bytes \
+      /sys/class/drm/renderD*/device/lmem_total_bytes \
+      /sys/class/drm/renderD*/device/local_memory_bytes; do
+      [ -e "$sysfs_path" ] || continue
+      [ -r "$sysfs_path" ] || continue
+      bytes="$(cat "$sysfs_path" 2>/dev/null || echo 0)"
+      [[ "$bytes" =~ ^[0-9]+$ ]] || continue
+      [ "$bytes" -gt 0 ] || continue
+      mib=$((bytes / 1024 / 1024))
+      [ "$mib" -gt 0 ] || continue
+      if [ "$vram_mib" -eq 0 ] || [ "$mib" -lt "$vram_mib" ]; then
+        vram_mib="$mib"
+      fi
+    done
+
+    if [ "${vram_mib:-0}" -gt 0 ]; then
+      vram_source="sysfs"
+    fi
   fi
+
+  if [ "${vram_mib:-0}" -le 0 ]; then
+    echo "    VRAM detection failed via xpu-smi and sysfs; assuming 32 GiB per GPU."
+    vram_mib=32768
+    vram_source="assumed"
+  fi
+
+  echo "    VRAM per GPU: $((vram_mib / 1024)) GiB (source: ${vram_source})"
 
   # Model size (MiB) from local cache directory
   local model_mib=0
