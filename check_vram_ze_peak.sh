@@ -130,10 +130,11 @@ with open(log_path, "r", encoding="utf-8", errors="ignore") as f:
 mem_candidates_mib = []
 
 size_patterns = [
-    re.compile(r"(?i)\\b(?:global|local|device)\\s+memory(?:\\s+size)?\\s*[:=]\\s*([0-9][0-9,\\.]*)\\s*([kmgt]?i?b|bytes?|b)?"),
-    re.compile(r"(?i)\\bvram(?:\\s+size)?\\s*[:=]\\s*([0-9][0-9,\\.]*)\\s*([kmgt]?i?b|bytes?|b)?"),
-    re.compile(r"(?i)\\bmemory_physical_size_byte\\s*[:=]\\s*([0-9]+)"),
-    re.compile(r"(?i)\\blocal_memory_size_byte\\s*[:=]\\s*([0-9]+)"),
+    re.compile(r"(?i)\b(?:global|local|device)\s+memory(?:\s+size)?\s*[:=]\s*([0-9][0-9,\.]*)\s*([kmgt]?i?b|bytes?|b)?"),
+    re.compile(r"(?i)\bvram(?:\s+size)?\s*[:=]\s*([0-9][0-9,\.]*)\s*([kmgt]?i?b|bytes?|b)?"),
+    re.compile(r"(?i)\bmemory_physical_size_byte\s*[:=]\s*([0-9]+)"),
+    re.compile(r"(?i)\blocal_memory_size_byte\s*[:=]\s*([0-9]+)"),
+    re.compile(r"(?i)\bmaxMemAllocSize\s*[:=]\s*([0-9]+)\s*bytes?"),
 ]
 
 
@@ -182,5 +183,6 @@ recommended = min(filtered)
 
 print("VRAM_DETECTED_MIB_VALUES=" + ",".join(str(v) for v in filtered))
 print(f"VLLM_VRAM_MIB_RECOMMENDED={recommended}")
+print("NOTE: values from maxMemAllocSize are max single-allocation limits, typically slightly below total VRAM.")
 print("Example: VLLM_VRAM_MIB=" + str(recommended) + " ./start.sh")
 PY
