@@ -12,12 +12,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_URL="https://cdrdv2.intel.com/v1/dl/getContent/919991/919992?filename=multi-arc-bmg-offline-installer-26.18.8.2-combo.tar.xz"
 ROOT_ZE_PEER="$SCRIPT_DIR/ze_peer"
+LOCAL_ZE_PEER="/usr/local/bin/ze_peer"
 
 ZE_PEER_BIN=""
 
 # Repo-root ze_peer is the canonical cached location.
 if [[ -x "$ROOT_ZE_PEER" ]]; then
     ZE_PEER_BIN="$ROOT_ZE_PEER"
+fi
+
+if [[ -z "$ZE_PEER_BIN" ]]; then
+    if [[ -x "$LOCAL_ZE_PEER" ]]; then
+        cp "$LOCAL_ZE_PEER" "$ROOT_ZE_PEER"
+        chmod +x "$ROOT_ZE_PEER"
+        ZE_PEER_BIN="$ROOT_ZE_PEER"
+    fi
 fi
 
 if [[ -z "$ZE_PEER_BIN" ]]; then

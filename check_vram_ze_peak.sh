@@ -5,12 +5,13 @@ set -euo pipefail
 # Determine per-GPU VRAM (MiB) using ze_peak output.
 # The script prepares ze_peak similarly to check_p2p_support.sh:
 # - use repo-root cached binary if present
-# - otherwise copy from extracted installer dir
+# - otherwise copy from /usr/local/bin or an extracted installer dir
 # - otherwise download installer tar and extract ze_peak (+ .spv files)
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DOWNLOAD_URL="https://cdrdv2.intel.com/v1/dl/getContent/919991/919992?filename=multi-arc-bmg-offline-installer-26.18.8.2-combo.tar.xz"
 ROOT_ZE_PEAK="$SCRIPT_DIR/ze_peak"
+LOCAL_ZE_PEAK="/usr/local/bin/ze_peak"
 SPV_CACHE_DIR="$SCRIPT_DIR/ze_peak_spv"
 
 ZE_PEAK_BIN=""
@@ -34,6 +35,14 @@ prepare_from_installer_dir() {
 
 if [[ -x "$ROOT_ZE_PEAK" ]]; then
     ZE_PEAK_BIN="$ROOT_ZE_PEAK"
+fi
+
+if [[ -z "$ZE_PEAK_BIN" ]]; then
+    if [[ -x "$LOCAL_ZE_PEAK" ]]; then
+        cp "$LOCAL_ZE_PEAK" "$ROOT_ZE_PEAK"
+        chmod +x "$ROOT_ZE_PEAK"
+        ZE_PEAK_BIN="$ROOT_ZE_PEAK"
+    fi
 fi
 
 if [[ -z "$ZE_PEAK_BIN" ]]; then
