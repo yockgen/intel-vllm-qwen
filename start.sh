@@ -52,8 +52,9 @@ CACHE_DIR="$HF_MODEL_CACHE_ROOT/$MODEL_DIR_BASENAME"
 # override per run with e.g. `VLLM_MAX_MODEL_LEN=8192 ./start.sh`.
 VLLM_MAX_MODEL_LEN="${VLLM_MAX_MODEL_LEN:-65536}"
 VLLM_CPU_OFFLOAD_GB="${VLLM_CPU_OFFLOAD_GB:-0}"
-# Tensor-parallel size is explicit: set it in deploy.conf (via deploy.sh) or env.
-# Default remains 1 when not provided.
+# Track whether the user supplied TP size; if not, auto-detect after model is cached.
+_tp_user_set=0
+[ -n "${VLLM_TENSOR_PARALLEL_SIZE+x}" ] && _tp_user_set=1
 VLLM_TENSOR_PARALLEL_SIZE="${VLLM_TENSOR_PARALLEL_SIZE:-1}"
 VLLM_ENFORCE_EAGER="${VLLM_ENFORCE_EAGER:-1}"
 VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
@@ -208,6 +209,74 @@ model_cached() {
   return 1
 }
 
+# Auto-set VLLM_TENSOR_PARALLEL_SIZE from GPU VRAM and model disk size.
+# Requires: CACHE_DIR, /dev/dri/renderD* devices, check_vram_ze_peak.sh.
+_auto_tensor_parallel() {
+  echo "==> Auto-detecting VLLM_TENSOR_PARALLEL_SIZE (not set by user)..."
+
+  # Count GPUs from render nodes (renderD128, renderD129, …)
+  local gpu_count
+  gpu_count=$(ls /dev/dri/renderD* 2>/dev/null | wc -l)
+  if [ "$gpu_count" -le 0 ]; then
+    echo "    No /dev/dri/renderD* devices found; defaulting to tp=1."
+    VLLM_TENSOR_PARALLEL_SIZE=1; return
+  fi
+  echo "    Detected $gpu_count XPU GPU(s)"
+
+  # Per-GPU VRAM (MiB): prefer ze_peak helper script, then 32 GiB fallback.
+  local vram_mib=0
+  local vram_source=""
+  local vram_checker="$DIR/check_vram_ze_peak.sh"
+  local checker_output=""
+
+  if [ -f "$vram_checker" ]; then
+    checker_output="$(bash "$vram_checker" 2>&1 || true)"
+    printf '%s\n' "$checker_output" | sed 's/^/    [ze_peak] /'
+    vram_mib="$(printf '%s\n' "$checker_output" | sed -n 's/^VLLM_VRAM_MIB_RECOMMENDED=\([0-9][0-9]*\)$/\1/p' | tail -n 1)"
+    if [[ "${vram_mib:-}" =~ ^[0-9]+$ ]] && [ "$vram_mib" -gt 0 ]; then
+      vram_source="ze_peak"
+    else
+      vram_mib=0
+    fi
+  else
+    echo "    VRAM checker script not found: $vram_checker"
+  fi
+
+  if [ "${vram_mib:-0}" -le 0 ]; then
+    echo "    VRAM detection failed via ze_peak checker; assuming 32 GiB per GPU."
+    vram_mib=32768
+    vram_source="assumed"
+  fi
+
+  echo "    VRAM per GPU: $((vram_mib / 1024)) GiB (source: ${vram_source})"
+
+  # Model size (MiB) from local cache directory
+  local model_mib=0
+  if [ -d "$CACHE_DIR" ]; then
+    model_mib=$(du -sm "$CACHE_DIR" 2>/dev/null | cut -f1) || model_mib=0
+  fi
+  if [ "${model_mib:-0}" -le 0 ]; then
+    echo "    Model cache empty or missing; defaulting to tp=1."
+    VLLM_TENSOR_PARALLEL_SIZE=1; return
+  fi
+  echo "    Model size on disk: ${model_mib} MiB ($((model_mib / 1024)) GiB)"
+
+  # Minimum GPUs = ceil(model_MiB / (vram_MiB * 0.90)), reserving 10% for KV cache
+  local tp
+  tp=$(python3 -c "
+import math
+print(max(1, math.ceil($model_mib / ($vram_mib * 0.90))))
+" 2>/dev/null) || tp=1
+
+  if [ "$tp" -gt "$gpu_count" ]; then
+    echo "    WARNING: model needs ~${tp} GPUs but only $gpu_count available; capping."
+    tp="$gpu_count"
+  fi
+
+  VLLM_TENSOR_PARALLEL_SIZE="$tp"
+  echo "    Auto-set VLLM_TENSOR_PARALLEL_SIZE=$VLLM_TENSOR_PARALLEL_SIZE"
+}
+
 echo "==> HuggingFace model cache: $CACHE_DIR"
 [ -n "$HF_GGUF_FILE" ] && echo "    GGUF file: $HF_GGUF_FILE"
 mkdir -p "$HF_MODEL_CACHE_ROOT"
@@ -247,6 +316,11 @@ fi
 if [ "$PULL_ONLY" = 1 ]; then
   echo "==> Pull-only: model is cached at $CACHE_DIR (not serving)."
   exit 0
+fi
+
+# Auto-detect TP size now that the model is guaranteed to be on disk.
+if [ "$_tp_user_set" = 0 ]; then
+  _auto_tensor_parallel
 fi
 
 echo "==> Start container ($IMAGE) with $MODEL_IN_CONTAINER"
@@ -289,6 +363,47 @@ OFFLOAD_QUANT_ENV=()
 if [ -n "$VLLM_QUANTIZATION" ]; then
   OFFLOAD_QUANT_ENV=(-e "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT}")
 fi
+
+# Apply hardware profile defaults (VLLM_HW_PROFILE=non-P2P, etc.)
+# shellcheck source=hw-profiles.conf
+. "$DIR/hw-profiles.conf"
+
+_apply_hw_profile() {
+  local profile="$1"
+  [ -z "$profile" ] && return 0
+  local array_var="profile_${profile//-/_}_vars"
+  if declare -p "$array_var" >/dev/null 2>&1; then
+    eval "local -a arr=(\"\${${array_var}[@]}\")"
+    for item in "${arr[@]}"; do
+      # Only set if not already in environment
+      local key="${item%%=*}" val="${item#*=}"
+      eval "${key}=\"\${${key}:-${val}}\""
+    done
+  else
+    echo "WARNING: unknown VLLM_HW_PROFILE='$profile' — no hardware defaults applied." >&2
+  fi
+}
+_resolved_hw_profile="${VLLM_HW_PROFILE:-}"
+if [ -z "$_resolved_hw_profile" ] && [ "${VLLM_TENSOR_PARALLEL_SIZE:-1}" -gt 1 ]; then
+  p2p_checker="$DIR/check_p2p_support.sh"
+  if [ -x "$p2p_checker" ]; then
+    echo "==> Checking host P2P capability via $p2p_checker"
+    p2p_result="$($p2p_checker 2>&1 || true)"
+    printf '%s\n' "$p2p_result" | sed 's/^/    /'
+
+    if printf '%s\n' "$p2p_result" | grep -q "P2P_SUPPORTED"; then
+      echo "==> P2P supported: no non-P2P hardware profile applied"
+    else
+      _resolved_hw_profile="non-P2P"
+      echo "==> Auto-select hardware profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+    fi
+  else
+    _resolved_hw_profile="non-P2P"
+    echo "==> P2P checker not found; fallback profile: $_resolved_hw_profile (tp=${VLLM_TENSOR_PARALLEL_SIZE})"
+  fi
+fi
+_apply_hw_profile "$_resolved_hw_profile"
+
 ZE_ENV=()
 if [ -n "${ZE_AFFINITY_MASK:-}" ]; then
   ZE_ENV=(-e "ZE_AFFINITY_MASK=${ZE_AFFINITY_MASK}")
