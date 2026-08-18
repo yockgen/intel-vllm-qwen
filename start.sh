@@ -467,7 +467,6 @@ fi
 echo "==> Running docker command (expanded):"
 set -x
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
-  --init \
   --pull=never \
   --user 0:0 \
   "${GROUP_OPTS[@]}" \
