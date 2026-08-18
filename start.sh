@@ -467,6 +467,7 @@ fi
 echo "==> Running docker command (expanded):"
 set -x
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
+  --init \
   --pull=never \
   --user 0:0 \
   "${GROUP_OPTS[@]}" \
@@ -474,6 +475,9 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   -v /dev/dri/by-path:/dev/dri/by-path \
   "${SHM_OPTS[@]}" \
   -e VLLM_TARGET_DEVICE=xpu \
+  -e ZE_FLAT_DEVICE_HIERARCHY="${ZE_FLAT_DEVICE_HIERARCHY:-COMPOSITE}" \
+  -e CCL_ZE_IPC_EXCHANGE="${CCL_ZE_IPC_EXCHANGE:-pidfd}" \
+  -e UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD="${UR_L0_V2_FORCE_DISABLE_COPY_OFFLOAD:-1}" \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
   -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
   "${OFFLOAD_QUANT_ENV[@]}" \
