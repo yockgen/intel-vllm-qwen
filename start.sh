@@ -357,6 +357,10 @@ OFFLOAD_QUANT_ENV=()
 if [ -n "$VLLM_QUANTIZATION" ]; then
   OFFLOAD_QUANT_ENV=(-e "VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT=${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT}")
 fi
+LD_LIBRARY_PATH_ENV=()
+if [ -n "$VLLM_LD_LIBRARY_PATH" ]; then
+  LD_LIBRARY_PATH_ENV=(-e "LD_LIBRARY_PATH=${VLLM_LD_LIBRARY_PATH}")
+fi
 
 # Apply hardware profile defaults (VLLM_HW_PROFILE=non-P2P, etc.)
 # shellcheck source=hw-profiles.conf
@@ -454,7 +458,6 @@ else
 fi
 
 # Weights are local now; keep the serve container off the network for models.
-  # -e LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH}" \
 echo "==> Running docker command (expanded):"
 set -x
 docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
@@ -468,6 +471,7 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   -e VLLM_ALLOW_LONG_MAX_MODEL_LEN="${VLLM_ALLOW_LONG_MAX_MODEL_LEN:-1}" \
   -e VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}" \
   "${OFFLOAD_QUANT_ENV[@]}" \
+  "${LD_LIBRARY_PATH_ENV[@]}" \
   "${ZE_ENV[@]}" \
   "${CCL_ENV[@]}" \
   "${INT4_ENV[@]}" \
