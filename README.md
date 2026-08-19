@@ -9,18 +9,18 @@ Under the hood `deploy.sh` calls two lower-level scripts, which you can also run
 - **`start.sh`** — loads the image (if needed), downloads the model **once** into a persistent cache, clears any old container, and serves it. Everything is tuned via environment variables (see [Environment reference](#environment-reference)).
 - **`stop.sh`** — stops and removes the container (the model cache is left intact) and verifies the port was freed.
 
-**Default models in `deploy.conf`:** `qwen3.6-35b-a3b` (`Qwen/Qwen3.6-35B-A3B` MoE, `sym_int4`, ~8k context, port 8000) and `gemma4-e4b` (`google/gemma-4-E4B-it`, port 8001). Add your own with one line each — see [Managing models with deploy.sh](#managing-models-with-deploysh).
+**Default models in `deploy.conf`:** `qwen3.6-35b-a3b` (`Qwen/Qwen3.6-35B-A3B` MoE, ~8k context, port 8000) and `gemma4-e4b` (`google/gemma-4-E4B-it`, port 8001). Add your own with one line each — see [Managing models with deploy.sh](#managing-models-with-deploysh).
 
 ## Prerequisites
 
 - Docker (or Podman with compatible `docker` CLI)
 - Intel Arc GPU with `/dev/dri` available on the host
-- Image `intel/llm-scaler-vllm:latest` locally (or whichever image you set in `VLLM_IMAGE`), or `llm-scaler-vllm.tar` in this directory (loaded automatically)
+- Image `intel/llm-scaler-vllm:0.21.0-b2` locally (or whichever image you set in `VLLM_IMAGE`), or `llm-scaler-vllm.tar` in this directory (loaded automatically)
 - Enough **disk** under `HF_MODEL_CACHE_ROOT` for the chosen model
 - For gated models: `HF_TOKEN` set on first download
 - First Hub download only: outbound network; hosts with **direct** external access may need to [unset corporate proxy](#bypassing-http-proxy-for-downloads) for `pull`/`up` (serve stays offline afterward)
 
-Default image tag in script: `intel/llm-scaler-vllm:latest` (override with `VLLM_IMAGE`). The image is never pulled from a registry — `start.sh` only `docker load`s a local `llm-scaler-vllm.tar` or uses an already-loaded image, then runs everything offline.
+Default image tag in script: `intel/llm-scaler-vllm:0.21.0-b2`. Override it directly with `VLLM_IMAGE=registry.example/vllm:tag ./start.sh`, or add `VLLM_IMAGE=registry.example/vllm:tag` to a `model` entry in `deploy.conf`. If no local tarball or image is available, `start.sh` pulls the selected image from its registry.
 
 ## Quick start
 
@@ -349,7 +349,7 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_IMAGE` | `intel/llm-scaler-vllm:latest` | Docker image (loaded locally, never pulled) |
+| `VLLM_IMAGE` | `intel/llm-scaler-vllm:0.21.0-b2` | Docker image; override directly or per `deploy.conf` model |
 | `VLLM_CONTAINER_NAME` | `vllm` | Container name |
 | `VLLM_PORT` | `8000` | Host port → API `8000` |
 | `VLLM_IPC` | `host` | `host` → `--ipc=host`; else use `VLLM_SHM_SIZE` (default `16g`) |
@@ -360,7 +360,7 @@ Cache path: `$HF_MODEL_CACHE_ROOT/$(basename "$HF_MODEL_ID")`.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VLLM_QUANTIZATION` | `sym_int4` for 35B MoE (1 GPU) | Online quant: `sym_int4`, `fp8`, etc. Set **empty** for no quant |
+| `VLLM_QUANTIZATION` | *(empty)* | Online quant: `sym_int4`, `fp8`, etc. Unset or set empty for no quant; select it explicitly per launch or model |
 | `VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT` | `1` | Use host RAM during FP8/INT4 load (only if quant enabled) |
 | `VLLM_GPU_MEMORY_UTILIZATION` | `0.90` | Fraction of XPU memory for weights + KV cache |
 | `VLLM_CPU_OFFLOAD_GB` | `0` | vLLM `--cpu-offload-gb`; **not recommended** for Qwen3.5 MoE on XPU |
