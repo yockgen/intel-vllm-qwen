@@ -61,6 +61,12 @@ VLLM_BLOCK_SIZE="${VLLM_BLOCK_SIZE:-64}"
 VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT="${VLLM_OFFLOAD_WEIGHTS_BEFORE_QUANT:-1}"
 VLLM_LD_LIBRARY_PATH="${VLLM_LD_LIBRARY_PATH:-/opt/intel/oneapi/ccl/latest/lib:/opt/intel/oneapi/2025.3/lib}"
 
+# No-P2P stable communication defaults for multi-GPU TP setups
+ONECCL_P2P_DISABLE="${ONECCL_P2P_DISABLE:-1}"
+FI_PROVIDER="${FI_PROVIDER:-shm}"
+FI_TCP_IFACE="${FI_TCP_IFACE:-lo}"
+VLLM_DISABLE_CUSTOM_ALLREDUCE="${VLLM_DISABLE_CUSTOM_ALLREDUCE:-1}"
+
 _large_moe=0
 [[ "$MODEL_DIR_BASENAME" == *35B* || "$MODEL_DIR_BASENAME" == *122B* || "$MODEL_DIR_BASENAME" == *30B*A3B* ]] && _large_moe=1
 _prequant_fp8=0
@@ -427,6 +433,19 @@ fi
 if [ -n "${CCL_SYCL_ALLTOALL_TMP_BUF:-}" ]; then
   CCL_ENV+=(-e "CCL_SYCL_ALLTOALL_TMP_BUF=${CCL_SYCL_ALLTOALL_TMP_BUF}")
 fi
+
+# No-P2P stable communication fallback for multi-GPU TP setups
+P2P_FALLBACK_ENV=()
+if [ -n "${ONECCL_P2P_DISABLE:-}" ]; then
+  P2P_FALLBACK_ENV+=(-e "ONECCL_P2P_DISABLE=${ONECCL_P2P_DISABLE}")
+fi
+if [ -n "${FI_PROVIDER:-}" ]; then
+  P2P_FALLBACK_ENV+=(-e "FI_PROVIDER=${FI_PROVIDER}")
+fi
+if [ -n "${FI_TCP_IFACE:-}" ]; then
+  P2P_FALLBACK_ENV+=(-e "FI_TCP_IFACE=${FI_TCP_IFACE}")
+fi
+
 PREFIX_CACHE_ARGS=()
 if [ "${VLLM_PREFIX_CACHING:-1}" = "0" ]; then
   PREFIX_CACHE_ARGS=(--no-enable-prefix-caching)
@@ -450,6 +469,11 @@ TOOL_ARGS=()
 if [ "${VLLM_ENABLE_AUTO_TOOL_CHOICE:-1}" != "0" ]; then
   TOOL_ARGS+=(--enable-auto-tool-choice)
   TOOL_ARGS+=(--tool-call-parser "${VLLM_TOOL_CALL_PARSER:-hermes}")
+fi
+
+CUSTOM_ALLREDUCE_ARGS=()
+if [ "${VLLM_DISABLE_CUSTOM_ALLREDUCE:-0}" = "1" ]; then
+  CUSTOM_ALLREDUCE_ARGS+=(--disable-custom-all-reduce)
 fi
 
 GROUP_OPTS=(--group-add keep-groups)
@@ -485,7 +509,8 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${OFFLOAD_QUANT_ENV[@]}" \
   "${ZE_ENV[@]}" \
   "${CCL_ENV[@]}" \
-  "${INT4_ENV[@]}" \
+  "${P2P_FALLBACK_ENV[@]}" \
+  "${INT4_ENV[@]}"
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -p "${HOST_PORT}:8000" \
@@ -508,6 +533,7 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${PREFIX_CACHE_ARGS[@]}" \
   "${ROPE_ARGS[@]}" \
   "${TOOL_ARGS[@]}" \
+  "${CUSTOM_ALLREDUCE_ARGS[@]}" \
   --trust-remote-code \
   ${VLLM_EXTRA_ARGS:-}
 set +x
