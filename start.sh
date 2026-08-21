@@ -510,7 +510,7 @@ docker run -d --name "$CONTAINER_NAME" --restart unless-stopped \
   "${ZE_ENV[@]}" \
   "${CCL_ENV[@]}" \
   "${P2P_FALLBACK_ENV[@]}" \
-  "${INT4_ENV[@]}"
+  "${INT4_ENV[@]}" \
   -e HF_HUB_OFFLINE=1 \
   -e TRANSFORMERS_OFFLINE=1 \
   -p "${HOST_PORT}:8000" \
